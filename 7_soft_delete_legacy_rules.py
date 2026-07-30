@@ -1,33 +1,32 @@
 """
-Soft Delete Legacy Rules Script.
+Soft Delete Legacy Rules Script (With Active Reference Safety Guard).
 
-This module processes a migration blueprint file (CSV or Excel) containing old/legacy
-rule definitions and executes soft-deletion requests via the MLS Admin Microservice API.
+Parses 'temp-data/migration_blueprint.csv' and checks the staging database to ensure
+that targeted legacy rules are NOT currently in use by other unmigrated MLS sources.
+Only soft-deletes rules that have ZERO remaining active references via the MLS Admin API.
 
 API Specification:
     Method: DELETE
     Endpoint: https://stage-ext-ms.data.kw.com/v1/mls-admin/rules
-    Headers:
-        - accept: application/json
-        - api-key: <API_KEY>
-    Query Params:
-        - name (str, required): Rule name to soft delete
-        - deleted_by (str, optional): User performing the deletion (uses DB_USER from .env)
-
-Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
+import io
 import sys
 import requests
 import pandas as pd
+import psycopg2
+import paramiko
+from pathlib import Path
 from dotenv import load_dotenv
+from sshtunnel import SSHTunnelForwarder
+from cryptography.hazmat.primitives import serialization
+
 from pipeline_logger import setup_logger
 
 load_dotenv()
 logger = setup_logger("Stage7_SoftDelete")
 
-# Read API credentials and DB_USER from environment variables
 API_BASE_URL = os.getenv("MLS_ADMIN_API_URL", "https://stage-ext-ms.data.kw.com")
 API_KEY = os.getenv("MLS_ADMIN_API_KEY", "")
 DELETED_BY_USER = os.getenv("DB_USER", "mls_admin")
@@ -54,19 +53,79 @@ def load_old_rule_names_from_blueprint(blueprint_path: str) -> list[str]:
     return df[column_name].dropna().astype(str).unique().tolist()
 
 
+def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
+    """
+    Connects to DB over SSH tunnel to check if rules are still referenced by ANY active MLS mapping.
+    Returns a dict mapping rule_name -> active_reference_count.
+    """
+    ssh_host = os.getenv("SSH_HOST", "").strip("'\"")
+    ssh_user = os.getenv("SSH_USER", "").strip("'\"")
+    ssh_key_path = os.getenv("SSH_KEY_PATH", "").strip("'\"")
+    ssh_passphrase = os.getenv("SSH_KEY_PASSPHRASE", "").strip("'\"")
+
+    db_host = os.getenv("DB_HOST", "").strip("'\"")
+    db_name = os.getenv("DB_NAME", "").strip("'\"")
+    db_user = os.getenv("DB_USER", "").strip("'\"")
+    db_pass = os.getenv("DB_PASSWORD", "").strip("'\"")
+
+    usage_counts = {name: 0 for name in rule_names}
+
+    try:
+        with open(ssh_key_path, "rb") as key_file:
+            private_key = serialization.load_pem_private_key(
+                key_file.read(),
+                password=ssh_passphrase.encode() if ssh_passphrase else None,
+            )
+        pem_data = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
+
+        with SSHTunnelForwarder(
+            (ssh_host, 22),
+            ssh_username=ssh_user,
+            ssh_pkey=mypkey,
+            remote_bind_address=(db_host, 5432),
+        ) as tunnel:
+            with psycopg2.connect(
+                dbname=db_name,
+                user=db_user,
+                password=db_pass,
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
+            ) as conn:
+                with conn.cursor() as cur:
+                    # Query active process_rule associations
+                    query = """
+                        SELECT pr.name, COUNT(mra.id) AS active_refs
+                        FROM public.process_rule pr
+                        JOIN public.map_rule_association mra ON pr.id = mra.process_rule_id
+                        JOIN public.mls_resource mr ON mra.process_map_id = mr.process_map_id
+                        JOIN public.mls m ON mr.mls_id = m.id
+                        WHERE pr.deleted_at IS NULL 
+                          AND m.mls_status_id = 2
+                          AND pr.name = ANY(%s)
+                        GROUP BY pr.name;
+                    """
+                    cur.execute(query, (rule_names,))
+                    for rule_name, count in cur.fetchall():
+                        usage_counts[rule_name] = count
+
+    except Exception as e:
+        logger.error(f"Failed to verify active rule usage from DB: {e}", exc_info=True)
+
+    return usage_counts
+
+
 def delete_rule_via_api(rule_name: str, deleted_by: str) -> bool:
     """Sends a DELETE request matching the exact Swagger curl call."""
-    # Matched path: /v1/mls-admin/rules
     url = f"{API_BASE_URL.rstrip('/')}/v1/mls-admin/rules"
-
-    params = {
-        "name": rule_name,
-        "deleted_by": deleted_by
-    }
+    params = {"name": rule_name, "deleted_by": deleted_by}
 
     try:
         response = requests.delete(url, headers=HEADERS, params=params, timeout=10)
-
         if response.status_code in (200, 204):
             data = response.json()
             rule_id = data.get("id", "N/A")
@@ -75,7 +134,6 @@ def delete_rule_via_api(rule_name: str, deleted_by: str) -> bool:
         else:
             logger.error(f"Failed for '{rule_name}' [HTTP {response.status_code}]: {response.text}")
             return False
-
     except requests.RequestException as e:
         logger.error(f"Request exception for '{rule_name}': {e}", exc_info=True)
         return False
@@ -83,29 +141,50 @@ def delete_rule_via_api(rule_name: str, deleted_by: str) -> bool:
 
 def main() -> None:
     BLUEPRINT_FILE = "temp-data/migration_blueprint.csv"
-
-    logger.info("--- 🗑️  MLS Admin Microservice Soft Delete Tool ---")
+    logger.info("--- 🗑️  MLS Admin Microservice Safe Soft Delete Tool ---")
 
     rule_names = load_old_rule_names_from_blueprint(BLUEPRINT_FILE)
-    logger.info(f"Found {len(rule_names)} legacy rule(s) targeted for soft-deletion.")
-    logger.info(f"Deletion attribution: deleted_by = '{DELETED_BY_USER}'")
+    logger.info(f"Loaded {len(rule_names)} legacy rule(s) from migration blueprint.")
 
-    logger.info("Legacy Rules targeted for deletion:")
-    for idx, name in enumerate(rule_names, 1):
+    # Check active usage across remaining MLS sources
+    logger.info("Verifying active rule dependencies across unmigrated MLS sources...")
+    usage_counts = get_active_rule_usage_counts(rule_names)
+
+    rules_to_delete = []
+    rules_to_keep = []
+
+    for name in rule_names:
+        active_refs = usage_counts.get(name, 0)
+        if active_refs > 0:
+            rules_to_keep.append((name, active_refs))
+        else:
+            rules_to_delete.append(name)
+
+    if rules_to_keep:
+        logger.info(f"⚠️ Retaining {len(rules_to_keep)} rule(s) because they are still used by unmigrated MLSs:")
+        for name, refs in rules_to_keep:
+            logger.info(f"   • '{name}' (Used by {refs} active mapping(s) — SKIPPED)")
+
+    if not rules_to_delete:
+        logger.info("🎉 No rules are ready for soft-deletion in this batch (all rules are still shared by unmigrated MLSs).")
+        return
+
+    logger.info(f"✅ Ready to soft-delete {len(rules_to_delete)} fully unlinked legacy rule(s):")
+    for idx, name in enumerate(rules_to_delete, 1):
         logger.info(f"   {idx}. {name}")
 
-    confirm = input(f"\nAre you sure you want to delete these {len(rule_names)} rule(s) via API? (y/N): ")
+    confirm = input(f"\nConfirm soft-deletion of {len(rules_to_delete)} unlinked rule(s)? (y/N): ")
     if confirm.lower() != "y":
         logger.info("Operation cancelled by user.")
         return
 
     logger.info("Starting API deletion sequence...")
     success_count = 0
-    for name in rule_names:
+    for name in rules_to_delete:
         if delete_rule_via_api(name, DELETED_BY_USER):
             success_count += 1
 
-    logger.info(f"Finished! Successfully soft-deleted {success_count}/{len(rule_names)} rule(s) via API.")
+    logger.info(f"Finished! Successfully soft-deleted {success_count}/{len(rules_to_delete)} rule(s) via API.")
 
 
 if __name__ == "__main__":
