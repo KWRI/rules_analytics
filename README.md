@@ -1,9 +1,40 @@
-# 🚀 MLS Rule Migration & Standardization Framework
+# 🚀 Rules Analytics & Automation Pipeline
 
-A modular, multi-stage database migration engine designed to standardize legacy rule naming conventions into **PascalCase** across staging and production infrastructure. The framework automates database extraction, case-insensitive translation compilation, microservice API registration, property schema tree transformation, bulk database mutation, production deployment, and intelligent ledger-backed git repository archiving.
+An automated, end-to-end framework for standardizing, registering, updating, soft-deleting, and archiving property data mapping rules across Staging and Production environments.
 
 ---
 
-## 🏛️ System Architecture & Workflow Pipeline
+## 📋 Table of Contents
+- [Prerequisites & Sibling Repositories](#-prerequisites--sibling-repositories)
+- [Local Machine Setup](#-local-machine-setup)
+- [Directory Structure](#-directory-structure)
+- [Batch Testing Configuration](#-batch-testing-configuration)
+- [Execution Lifecycle (Stage-by-Stage)](#-execution-lifecycle-stage-by-stage)
+- [Batch Processing & Shared Rule Safeguards](#-batch-processing--shared-rule-safeguards)
+- [Logging Infrastructure](#-logging-infrastructure)
+- [Troubleshooting & Common Edge Cases](#-troubleshooting--common-edge-cases)
+- [Best Practices & Safety Precautions](#-best-practices--safety-precautions)
 
-The migration pipeline operates in **9 sequential stages**, controlled via isolated execution scripts that communicate using file-based matrix assets in `temp-data/` and record system events into rotating logs (`logs/pipeline_YYYY-MM-DD.log`).
+---
+
+## 📋 Prerequisites & Sibling Repositories
+
+Before setting up the repository, ensure your environment meets the following software requirements:
+
+* **Python 3.10+** (Python 3.11 recommended)
+* **Git** installed and configured
+* Active SSH keys and credentials for internal rule microservices and database environments
+
+### Required Sibling Repositories
+
+This project relies on underlying core libraries and bulk update engines. Ensure the following sibling repositories are cloned into the **same parent directory** alongside `rules_analytics`:
+
+```text
+parent_folder/
+├── rules_analytics/           <-- (This repo)
+├── dm-consolidated-rules/     <-- Consolidated rule definitions (ui-rules/ active & archived)
+├── eim-mapex/                 <-- Mapex schema mapping dependencies
+├── eim-slp-tools/             <-- Execution tools & bulk update engine
+├── eim-snowflake-id/          <-- Snowflake ID utilities
+├── eim-utilities-pip/         <-- Internal pipeline utility package
+└── mapping-slp-rules/         <-- Mapping rules configuration repository
