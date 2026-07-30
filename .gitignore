@@ -1,0 +1,23 @@
+# Ignore pipeline output manifest spreadsheets and transient directories
+*.csv
+standard-rule-names/temp-data/
+temp-data/
+promotion_sources.txt
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Sensitive Environment & Secrets (DO NOT PUSH KEYS/PASSWORDS)
+.env
+.env.bulk
+
+# Python Cache & Logs
+__pycache__/
+*.py[cod]
+*.log
+
+# IDE Settings
+.idea/
+.vscode/
