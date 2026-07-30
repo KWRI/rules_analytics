@@ -7,6 +7,7 @@ highly isolated migration tunnel to the core Production environments, systematic
 verifying, and applying the fully tested staging rule changes to the production database nodes.
 
 Supports target MLS batch testing notice via 'temp-data/test_mls.txt' (via rules_utils.py).
+Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import io
@@ -18,10 +19,12 @@ from cryptography.hazmat.primitives import serialization
 from dotenv import load_dotenv
 
 from rules_utils import load_target_test_mls
+from pipeline_logger import setup_logger
 
 # DYNAMIC RESOLUTION: Find the .env file sitting right next to this root-level script
 current_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=current_dir / ".env")
+logger = setup_logger("Stage6_BulkPromotion")
 
 
 def run_production_promotion():
@@ -40,20 +43,20 @@ def run_production_promotion():
     filename_str = "promotion_sources.txt"
     remote_file = f"{remote_dir}/{filename_str}"
 
-    print("\n" + "=" * 60)
-    print("PRODUCTION PROMOTION ENGINE INITIALIZED")
-    print("=" * 60)
+    logger.info("============================================================")
+    logger.info("PRODUCTION PROMOTION ENGINE INITIALIZED")
+    logger.info("============================================================")
 
     # Check if active MLS batch targets exist in temp-data/test_mls.txt
     target_mls_set = load_target_test_mls(temp_data_dir)
     if target_mls_set:
-        print(f"🧪 [PROMOTION BATCH GUARD] Active MLS targets detected: {sorted(list(target_mls_set))}")
+        logger.info(f"🧪 [PROMOTION BATCH GUARD] Active MLS targets detected: {sorted(list(target_mls_set))}")
 
     # Immediate early-exit fail check if the source file wasn't created yet
     if not local_file_path.exists():
-        print(f"[ERROR] Local source file missing at {local_file_path}")
-        print("   Please ensure your sandbox extraction scripts ran and generated it first.")
-        print("=" * 60 + "\n")
+        logger.error(f"Local source file missing at {local_file_path}")
+        logger.error("Please ensure your sandbox extraction scripts ran and generated it first.")
+        logger.info("============================================================")
         return
 
     # 2. Initialize Client
@@ -77,31 +80,31 @@ def run_production_promotion():
         mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
 
         # 4. Connect to server
-        print(f"[1/4] Connecting to remote host {hostname}...")
+        logger.info(f"[1/4] Connecting to remote host {hostname}...")
         ssh.connect(hostname=hostname, username=username, pkey=mypkey, timeout=10)
 
         # 5. SFTP Upload using the resolved path object converted to string
-        print(f"[2/4] Uploading manifest to server path: {remote_file}...")
+        logger.info(f"[2/4] Uploading manifest to server path: {remote_file}...")
         sftp = ssh.open_sftp()
         sftp.put(str(local_file_path), remote_file)
         sftp.close()
-        print("[SUCCESS] Manifest staged successfully on remote file layer.")
+        logger.info("[SUCCESS] Manifest staged successfully on remote file layer.")
 
         # 6. Verify creation via remote terminal check
-        print(f"[3/4] Verifying remote payload structure consistency...")
+        logger.info(f"[3/4] Verifying remote payload structure consistency...")
         stdin, stdout, stderr = ssh.exec_command(f"cat {remote_file}")
         file_contents = stdout.read().decode().strip()
 
         if file_contents:
-            print("[INFO] Target Production Manifest records validated:")
+            logger.info("Target Production Manifest records validated:")
             for line in file_contents.splitlines():
-                print(f"   Targeted MLS ID: {line}")
+                logger.info(f"   Targeted MLS ID: {line}")
         else:
-            print(f"[ERROR] Upload finished but remote file is empty or missing.")
+            logger.error("Upload finished but remote file is empty or missing.")
             return
 
         # 7. EXECUTE REPETITIVE SEQUENTIAL INTERACTIVE TERMINAL STREAM
-        print(f"[4/4] Invoking production rule migration engine sequentially...")
+        logger.info("[4/4] Invoking production rule migration engine sequentially...")
 
         # Open an active interactive shell session channel
         channel = ssh.invoke_shell()
@@ -114,11 +117,11 @@ def run_production_promotion():
             "exit"  # Gracefully disconnects the channel session at completion
         ]
 
-        print("\n--- PRODUCTION SHELL INTERACTION OUTPUT LOGS ---")
+        logger.info("--- PRODUCTION SHELL INTERACTION OUTPUT LOGS ---")
 
         # Send each command string down the live socket stream sequentially
         for cmd in commands:
-            print(f"[INPUT] Sending interactive shell input: {cmd}")
+            logger.info(f"[INPUT] Sending interactive shell input: {cmd}")
             channel.send(cmd + "\n")
 
             # Allow the shell adequate time to process commands and stream output responses
@@ -127,24 +130,28 @@ def run_production_promotion():
             # Read and print the live incoming streaming buffer data from the terminal channel
             if channel.recv_ready():
                 output_chunk = channel.recv(4096).decode(errors="ignore")
-                print(output_chunk)
+                for line in output_chunk.splitlines():
+                    if line.strip():
+                        logger.info(f"[REMOTE SHELL] {line}")
 
         # Wait for the terminal process to wrap up its execution queue
         while not channel.exit_status_ready():
             time.sleep(1.0)
             if channel.recv_ready():
                 output_chunk = channel.recv(4096).decode(errors="ignore")
-                print(output_chunk)
+                for line in output_chunk.splitlines():
+                    if line.strip():
+                        logger.info(f"[REMOTE SHELL] {line}")
 
-        print("---------------------------------------------------\n")
-        print("[SUCCESS] Production update cycle completed sequentially.")
+        logger.info("---------------------------------------------------")
+        logger.info("[SUCCESS] Production update cycle completed sequentially.")
 
     except Exception as e:
-        print(f"\n[CRITICAL] PROMOTION PIPELINE FAILED: {e}")
+        logger.error(f"PROMOTION PIPELINE FAILED: {e}", exc_info=True)
     finally:
         ssh.close()
-        print("[INFO] Secure interactive session closed.")
-        print("=" * 60 + "\n")
+        logger.info("Secure interactive session closed.")
+        logger.info("============================================================")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ generation, populates language/group associations, and immediately invalidates U
 
 Supports target batch testing mode via 'temp-data/test_rules.txt' (via rules_utils.py)
 or single-rule testing mode via the `TEST_RULE_NAME` env variable.
+Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
@@ -23,12 +24,14 @@ from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
 
 from rules_utils import load_target_test_rules
+from pipeline_logger import setup_logger
 
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
 # Load environment variables
 load_dotenv()
+logger = setup_logger("Stage3_RegisterRules")
 
 
 def register_rules_via_microservice():
@@ -37,13 +40,13 @@ def register_rules_via_microservice():
     blueprint_path = temp_data_dir / "migration_blueprint.csv"
 
     if not blueprint_path.exists():
-        print(f"❌ [ERROR] Migration blueprint missing at {blueprint_path}")
-        print("   Please execute Stage 2 standardization first.")
+        logger.error(f"Migration blueprint missing at {blueprint_path}")
+        logger.error("Please execute Stage 2 standardization first.")
         return
 
     api_key = os.getenv("MLS_ADMIN_API_KEY", "").strip().strip("'\"")
     if not api_key:
-        print("❌ [ERROR] MLS_ADMIN_API_KEY missing from environment configuration.")
+        logger.error("MLS_ADMIN_API_KEY missing from environment configuration.")
         return
 
     stage_url_raw = os.getenv(
@@ -78,13 +81,13 @@ def register_rules_via_microservice():
                     migrations_to_execute.append((old_name, clean_new_name))
 
     if not migrations_to_execute:
-        print("ℹ️ [INFO] No pending migration entries found to insert.")
+        logger.info("No pending migration entries found to insert.")
         return
 
     if target_test_rules:
-        print(f"🧪 [BATCH TEST MODE] Targeting {len(migrations_to_execute)} rule(s)...")
+        logger.info(f"🧪 [BATCH TEST MODE] Targeting {len(migrations_to_execute)} rule(s)...")
     else:
-        print(f"🚀 [FULL PRODUCTION MODE] Registering {len(migrations_to_execute)} rules via microservice...")
+        logger.info(f"🚀 [FULL PRODUCTION MODE] Registering {len(migrations_to_execute)} rules via microservice...")
 
     # Fetch source content & metadata over SSH DB connection
     ssh_host = os.getenv("SSH_HOST", "").strip().strip("'\"")
@@ -114,6 +117,7 @@ def register_rules_via_microservice():
         )
         mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
 
+        logger.info(f"Establishing SSH tunnel to connect to database '{db_name}'...")
         with SSHTunnelForwarder(
             (ssh_host, 22),
             ssh_username=ssh_user,
@@ -142,7 +146,7 @@ def register_rules_via_microservice():
                         legacy_record = cur.fetchone()
 
                         if not legacy_record:
-                            print(f"⚠️ [WARNING] Source rule '{old_name}' not found in DB.")
+                            logger.warning(f"Source rule '{old_name}' not found in DB.")
                             continue
 
                         content, description, lang_name, group_name = legacy_record
@@ -171,24 +175,24 @@ def register_rules_via_microservice():
 
                         if res.status_code in [200, 201]:
                             res_data = res.json()
-                            print(f"  ✅ Created '{new_name}' | ID: {res_data.get('id')}")
+                            logger.info(f"Created '{new_name}' | ID: {res_data.get('id')}")
                             registered_count += 1
                         elif res.status_code == 409 or "already exists" in res.text.lower():
-                            print(f"  ℹ️ Skipped '{new_name}' (Already exists)")
+                            logger.info(f"Skipped '{new_name}' (Already exists)")
                             skipped_count += 1
                         else:
-                            print(f"  ❌ Failed to create '{new_name}' [{res.status_code}]: {res.text}")
+                            logger.error(f"Failed to create '{new_name}' [{res.status_code}]: {res.text}")
 
-                    print("\n" + "=" * 60)
-                    print("🚀 STAGE 3 COMPLETE: MICROSERVICE RULE REGISTRATION FINISHED")
-                    print("=" * 60)
-                    print(f" Target Blueprint Entries Evaluated : {len(migrations_to_execute)}")
-                    print(f" Successfully Registered Rules      : {registered_count}")
-                    print(f" Skipped / Already Existing Rules    : {skipped_count}")
-                    print("=" * 60 + "\n")
+                    logger.info("============================================================")
+                    logger.info("🚀 STAGE 3 COMPLETE: MICROSERVICE RULE REGISTRATION FINISHED")
+                    logger.info("============================================================")
+                    logger.info(f"Target Blueprint Entries Evaluated : {len(migrations_to_execute)}")
+                    logger.info(f"Successfully Registered Rules      : {registered_count}")
+                    logger.info(f"Skipped / Already Existing Rules    : {skipped_count}")
+                    logger.info("============================================================")
 
     except Exception as err:
-        print(f"❌ [ERROR] Pipeline Stage 3 execution failure: {err}")
+        logger.error(f"Pipeline Stage 3 execution failure: {err}", exc_info=True)
 
 
 if __name__ == "__main__":

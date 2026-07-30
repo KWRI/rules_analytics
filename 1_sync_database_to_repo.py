@@ -17,11 +17,13 @@ from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
+from pipeline_logger import setup_logger
 
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
 load_dotenv()
+logger = setup_logger("Stage1_DBSync")
 
 
 def write_backup_file(target_path: Path, content: str | None) -> None:
@@ -48,7 +50,7 @@ def sync_database_to_repo():
     repo_base_raw = os.getenv("REPO_PATH", "")
     repo_base = repo_base_raw.strip().strip("'\"")
     if not repo_base:
-        print("❌ Error: REPO_PATH not set in environment.")
+        logger.error("REPO_PATH not set in environment.")
         return
 
     ssh_host = os.getenv("SSH_HOST", "").strip().strip("'\"")
@@ -65,6 +67,9 @@ def sync_database_to_repo():
     active_base = ui_rules_root / "active"
     archived_base = ui_rules_root / "archived"
 
+    logger.info("Starting Core Database Ingress Sync...")
+    logger.info(f"Target UI Rules Directory: {ui_rules_root}")
+
     # Reset directories cleanly
     for folder in [active_base, archived_base]:
         folder.mkdir(parents=True, exist_ok=True)
@@ -73,7 +78,7 @@ def sync_database_to_repo():
                 item.unlink()
 
     try:
-        # Load and decrypt OpenSSH/RSA key using cryptography serialization (Matches Scripts 2-4)
+        # Load and decrypt OpenSSH/RSA key using cryptography serialization
         with open(ssh_key_path, "rb") as key_file:
             private_key = serialization.load_pem_private_key(
                 key_file.read(),
@@ -84,15 +89,16 @@ def sync_database_to_repo():
             format=serialization.PrivateFormat.TraditionalOpenSSL,
             encryption_algorithm=serialization.NoEncryption(),
         )
-        mypkey = paramiko.RSAKey.from_private_key(
-            io.StringIO(pem_data.decode()))
+        mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
 
+        logger.info(f"Establishing SSH tunnel to {ssh_host}...")
         with SSHTunnelForwarder(
                 (ssh_host, 22),
                 ssh_username=ssh_user,
                 ssh_pkey=mypkey,
                 remote_bind_address=(db_host, 5432),
         ) as tunnel:
+            logger.info(f"Connected to database '{db_name}' via SSH tunnel port {tunnel.local_bind_port}.")
             with psycopg2.connect(
                     dbname=db_name,
                     user=db_user,
@@ -100,11 +106,9 @@ def sync_database_to_repo():
                     host="127.0.0.1",
                     port=tunnel.local_bind_port,
             ) as conn:
-                conn.set_session(isolation_level="REPEATABLE READ",
-                                 readonly=True)
+                conn.set_session(isolation_level="REPEATABLE READ", readonly=True)
 
-                with conn.cursor(
-                        name="rule_pull_streaming_cursor") as streaming_cur:
+                with conn.cursor(name="rule_pull_streaming_cursor") as streaming_cur:
                     streaming_cur.itersize = 200
                     streaming_cur.execute(
                         "SELECT name, content, deleted_at FROM public.process_rule;"
@@ -140,22 +144,21 @@ def sync_database_to_repo():
 
                             target_file = target_dir / final_filename
                             futures.append(
-                                executor.submit(write_backup_file, target_file,
-                                                content)
+                                executor.submit(write_backup_file, target_file, content)
                             )
                             file_count += 1
 
                         for future in as_completed(futures):
                             future.result()
 
-                    print("\n" + "=" * 60)
-                    print("🚀 STAGE 1 COMPLETE: PERFECT REPOSITORY BACKUP SYNC")
-                    print("=" * 60)
-                    print(f" Total Unique Files Written to Disk: {file_count}")
-                    print("=" * 60 + "\n")
+                    logger.info("============================================================")
+                    logger.info("🚀 STAGE 1 COMPLETE: PERFECT REPOSITORY BACKUP SYNC")
+                    logger.info("============================================================")
+                    logger.info(f"Total Unique Files Written to Disk: {file_count}")
+                    logger.info("============================================================")
 
     except Exception as e:
-        print(f"❌ Execution failed: {e}")
+        logger.error(f"Execution failed: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

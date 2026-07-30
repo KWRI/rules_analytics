@@ -7,6 +7,7 @@ dry-run traces without mutating records. When executed with live parameters (`--
 the nested configuration nodes in the Staging database to reflect the new PascalCase specifications.
 
 Supports target MLS batch testing notice via 'temp-data/test_mls.txt' (via rules_utils.py).
+Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import sys
@@ -16,6 +17,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from rules_utils import load_target_test_mls
+from pipeline_logger import setup_logger
+
+logger = setup_logger("Stage5_BulkUpdate")
 
 # 1. Clear out active environment memory just to be safe
 forbidden_keys = [
@@ -38,7 +42,7 @@ utils_repo = os.getenv("UTILS_REPO_PATH")
 snowflake_repo = os.getenv("SNOWFLAKE_REPO_PATH")
 
 if not tools_repo or not utils_repo:
-    print("❌ Error: TOOLS_REPO_PATH or UTILS_REPO_PATH missing from .env.bulk configuration.")
+    logger.error("TOOLS_REPO_PATH or UTILS_REPO_PATH missing from .env.bulk configuration.")
     sys.exit(1)
 
 # 4. Core path injections
@@ -83,8 +87,8 @@ try:
                 mod = importlib.util.module_from_spec(spec)
                 sys.modules[target_mod] = mod
                 spec.loader.exec_module(mod)
-except Exception:
-    pass
+except Exception as e:
+    logger.warning(f"Snowflake namespace intercept skipped: {e}")
 
 if __name__ == "__main__":
     try:
@@ -92,7 +96,7 @@ if __name__ == "__main__":
         temp_data_dir = Path(current_dir) / "temp-data"
         target_mls_set = load_target_test_mls(temp_data_dir)
         if target_mls_set:
-            print(f"🧪 [STAGING BULK UPDATE GUARD] Active MLS targets detected: {sorted(list(target_mls_set))}")
+            logger.info(f"🧪 [STAGING BULK UPDATE GUARD] Active MLS targets detected: {sorted(list(target_mls_set))}")
 
         import bulk_map_tool
 
@@ -110,15 +114,17 @@ if __name__ == "__main__":
                         resolved_path = Path(current_dir) / "temp-data" / input_val
                         passthrough_args[idx] = str(resolved_path)
 
+            logger.info(f"Handing off execution to bulk_map_tool with args: {' '.join(passthrough_args)}")
+
             # Reconstruct sys.argv dynamically and handoff directly to core tool main engine execution
             sys.argv = ["bulk_map_tool.py"] + passthrough_args
             bulk_map_tool.main()
 
         else:
-            print("❌ Error: No runtime arguments provided.")
+            logger.error("No runtime arguments provided.")
             sys.exit(1)
 
     except ImportError as e:
-        print(f"❌ Missing Internal System Library Dependency: {e}")
+        logger.error(f"Missing Internal System Library Dependency: {e}", exc_info=True)
     except Exception as err:
-        print(f"❌ Execution failure during runtime mapping sequence: {err}")
+        logger.error(f"Execution failure during runtime mapping sequence: {err}", exc_info=True)

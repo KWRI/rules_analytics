@@ -6,6 +6,7 @@ PascalCase naming format. Concurrently writes transformed rule files to target
 directories and outputs a workspace mapping ledger (migration_blueprint.csv).
 
 Supports target batch testing mode via 'temp-data/test_rules.txt' using rules_utils.py.
+Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
@@ -26,11 +27,13 @@ from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
 
 from rules_utils import load_target_test_rules
+from pipeline_logger import setup_logger
 
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
 load_dotenv()
+logger = setup_logger("Stage2_StandardizeRules")
 
 
 def ensure_git_ignores_csv_artifacts(target_base_dir: Path) -> None:
@@ -110,7 +113,7 @@ def run_standardization():
     repo_path_raw = os.getenv("REPO_PATH", "")
     repo_path = repo_path_raw.strip().strip("'\"")
     if not repo_path:
-        print("❌ [ERROR] REPO_PATH missing from environment configuration.")
+        logger.error("REPO_PATH missing from environment configuration.")
         return
 
     project_dir = Path(__file__).resolve().parent
@@ -173,6 +176,7 @@ def run_standardization():
         )
         mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
 
+        logger.info(f"Connecting to database via SSH tunnel to extract records...")
         with SSHTunnelForwarder(
                 (ssh_host, 22),
                 ssh_username=ssh_user,
@@ -188,7 +192,7 @@ def run_standardization():
             ) as conn:
                 with conn.cursor() as cur:
                     if target_test_rules:
-                        print(f"🧪 [BATCH TEST MODE] Targeting {len(target_test_rules)} rule(s)...")
+                        logger.info(f"🧪 [BATCH TEST MODE] Targeting {len(target_test_rules)} rule(s)...")
                         select_query = """
                             SELECT id, name, content, description, params, "order", created_at, deleted_at 
                             FROM public.process_rule
@@ -196,7 +200,7 @@ def run_standardization():
                         """
                         cur.execute(select_query, (list(target_test_rules),))
                     else:
-                        print("🚀 [FULL PRODUCTION MODE] Pulling all process_rule records...")
+                        logger.info("🚀 [FULL PRODUCTION MODE] Pulling all process_rule records...")
                         select_query = """
                             SELECT id, name, content, description, params, "order", created_at, deleted_at 
                             FROM public.process_rule;
@@ -205,7 +209,7 @@ def run_standardization():
 
                     rows = cur.fetchall()
                     if not rows and target_test_rules:
-                        print("⚠️ Warning: No records found matching target test rule names.")
+                        logger.warning("No records found matching target test rule names.")
 
                     for row in rows:
                         _, old_name, content, _, _, _, created_at, deleted_at = row[:8]
@@ -228,7 +232,7 @@ def run_standardization():
                         })
 
     except Exception as err:
-        print(f"❌ [ERROR] Database connection or extraction failure: {err}")
+        logger.error(f"Database connection or extraction failure: {err}", exc_info=True)
         return
 
     csv_rows = []
@@ -290,19 +294,19 @@ def run_standardization():
             break
         except PermissionError as e:
             if attempt == 4:
-                print("❌ [ERROR] Critical Error: Unable to write CSV due to persistent file lock.")
+                logger.error("Critical Error: Unable to write CSV due to persistent file lock.")
                 raise e
             time.sleep(1.0)
 
-    print("\n" + "=" * 60)
-    print("🚀 PHASE 2 COMPLETE: HIGH-SPEED CASE-INSENSITIVE COMPILER")
-    print("=" * 60)
-    print(f" Mode                                     : {'BATCH TEST (' + str(len(target_test_rules)) + ' rules)' if target_test_rules else 'FULL PRODUCTION'}")
-    print(f" Standardized Active Rules Written        : {active_copied_count}")
-    print(f" Standardized Archived Rules Written      : {archived_copied_count}")
-    print(f" Unified (Active + Deleted) Rows in CSV   : {len(csv_rows)}")
-    print(f" Isolated Blueprint CSV Path              : {csv_output_path}")
-    print("=" * 60 + "\n")
+    logger.info("============================================================")
+    logger.info("🚀 PHASE 2 COMPLETE: HIGH-SPEED CASE-INSENSITIVE COMPILER")
+    logger.info("============================================================")
+    logger.info(f"Mode                                     : {'BATCH TEST (' + str(len(target_test_rules)) + ' rules)' if target_test_rules else 'FULL PRODUCTION'}")
+    logger.info(f"Standardized Active Rules Written        : {active_copied_count}")
+    logger.info(f"Standardized Archived Rules Written      : {archived_copied_count}")
+    logger.info(f"Unified (Active + Deleted) Rows in CSV   : {len(csv_rows)}")
+    logger.info(f"Isolated Blueprint CSV Path              : {csv_output_path}")
+    logger.info("============================================================")
 
 
 if __name__ == "__main__":

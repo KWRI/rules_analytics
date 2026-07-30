@@ -8,6 +8,7 @@ comprehensive database layout configuration map to 'temp-data/raw_targeted_rules
 a numerically sorted, unique integer list of affected IDs to 'temp-data/promotion_sources.txt'.
 
 Supports target MLS batch testing mode via 'temp-data/test_mls.txt' (via rules_utils.py).
+Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
@@ -24,12 +25,14 @@ from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
 
 from rules_utils import load_target_test_mls
+from pipeline_logger import setup_logger
 
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
 # Load environment variables from local .env
 load_dotenv()
+logger = setup_logger("Stage4_ExtractCSV")
 
 
 def extract_rules_recursive(schema_node, target_rules_set, current_path=""):
@@ -81,7 +84,7 @@ def run_production_extractor():
     repo_path_raw = os.getenv("REPO_PATH", "")
     repo_path = repo_path_raw.strip().strip("'\"")
     if not repo_path:
-        print("❌ Error: REPO_PATH missing from your environment configuration.")
+        logger.error("REPO_PATH missing from your environment configuration.")
         return
 
     # Base directory paths within the consolidated repo layout
@@ -98,15 +101,15 @@ def run_production_extractor():
     txt_output_path = temp_data_dir / "promotion_sources.txt"
 
     if not blueprint_path.exists() or not active_rules_dir.exists():
-        print("❌ Error: Stage 2 assets missing. Please execute Stage 2 standardization first.")
+        logger.error("Stage 2 assets missing. Please execute Stage 2 standardization first.")
         return
 
     # Check for target MLS batch testing file via rules_utils.py
     target_mls_set = load_target_test_mls(temp_data_dir)
     if target_mls_set:
-        print(f"🧪 [MLS BATCH FILTER] Targeting {len(target_mls_set)} specified MLS ID(s): {sorted(list(target_mls_set))}")
+        logger.info(f"🧪 [MLS BATCH FILTER] Targeting {len(target_mls_set)} specified MLS ID(s): {sorted(list(target_mls_set))}")
     else:
-        print("🚀 [FULL MODE] Executing extraction across ALL active MLS configurations...")
+        logger.info("🚀 [FULL MODE] Executing extraction across ALL active MLS configurations...")
 
     # 1. Load active mutations directly from Stage 2 blueprint
     blueprint_mapping = {}
@@ -123,11 +126,11 @@ def run_production_extractor():
                     blueprint_mapping[old_name] = clean_new_name
 
     if not blueprint_mapping:
-        print("🎉 No active rule mutations mapped in the blueprint to extract.")
+        logger.info("No active rule mutations mapped in the blueprint to extract.")
         return
 
     target_rules_set = set(blueprint_mapping.keys())
-    print(f"🎯 Target Rules Loaded from Blueprint: Processing {len(target_rules_set)} active rule mutation(s).")
+    logger.info(f"🎯 Target Rules Loaded from Blueprint: Processing {len(target_rules_set)} active rule mutation(s).")
 
     headers = [
         "vendor_name", "mls_id_str", "mls_id", "mls_name", "download_protocol",
@@ -163,6 +166,7 @@ def run_production_extractor():
         )
         mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
 
+        logger.info(f"Establishing SSH tunnel to connect to database '{db_name}'...")
         with SSHTunnelForwarder(
                 (ssh_host, 22),
                 ssh_username=ssh_user,
@@ -318,16 +322,16 @@ def run_production_extractor():
                             for unique_id in sorted(list(captured_mls_ids)):
                                 txt_f.write(f"{unique_id}\n")
 
-                print("\n" + "=" * 60)
-                print("🚀 STAGE 4 COMPLETE: ARCHITECTURAL EXTRACTION ENGINE SUCCESSFUL")
-                print("=" * 60)
-                print(f" Total Production Configurations Mutated : {total_match_count}")
-                print(f" Master File Ingress Destination (CSV)   : {output_csv_path}")
-                print(f" Unified Isolated Promotion Manifest     : {txt_output_path}")
-                print("=" * 60 + "\n")
+                logger.info("============================================================")
+                logger.info("🚀 STAGE 4 COMPLETE: ARCHITECTURAL EXTRACTION ENGINE SUCCESSFUL")
+                logger.info("============================================================")
+                logger.info(f"Total Production Configurations Mutated : {total_match_count}")
+                logger.info(f"Master File Ingress Destination (CSV)   : {output_csv_path}")
+                logger.info(f"Unified Isolated Promotion Manifest     : {txt_output_path}")
+                logger.info("============================================================")
 
     except Exception as e:
-        print(f"❌ Critical Failure: {e}")
+        logger.error(f"Critical Failure: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
