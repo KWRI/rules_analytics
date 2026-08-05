@@ -1,12 +1,12 @@
 """
-Update Consolidated Repo Script (With Safe Archival Check).
+Stage 8: Update Consolidated Repo Script (With Safe Archival Check)
 
 Moves soft-deleted legacy rule files from active/ to archived/ in the git repository ONLY
-if they have been soft-deleted in the database. Updates processed_mls_ledger.json.
+if they have been soft-deleted in the database. Updates processed_mls_ledger.json and
+cleans up local workspace artifacts.
 """
 
 import os
-import re
 import sys
 import json
 import shutil
@@ -18,14 +18,16 @@ from pathlib import Path
 from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.hazmat.primitives import serialization
+
 from pipeline_logger import setup_logger
 
-load_dotenv()
+current_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage8_RepoArchive")
 
 
 def load_old_rule_names(blueprint_path: Path) -> list[str]:
-    """Parses the migration blueprint and returns legacy rule names."""
+    """Parses the migration blueprint and returns unique legacy rule names."""
     if not blueprint_path.exists():
         logger.error(f"Blueprint file not found at '{blueprint_path}'")
         sys.exit(1)
@@ -37,11 +39,15 @@ def load_old_rule_names(blueprint_path: Path) -> list[str]:
         logger.error(f"Required column '{column_name}' missing from blueprint.")
         sys.exit(1)
 
-    return df[column_name].dropna().astype(str).unique().tolist()
+    legacy_rules = df[column_name].dropna().astype(str).str.strip()
+    return [r for r in legacy_rules.unique().tolist() if r and r.lower() != "nan"]
 
 
 def get_deleted_rules_set(rule_names: list[str]) -> set[str]:
-    """Checks database to return only rule names that have deleted_at IS NOT NULL."""
+    """
+    Checks database over SSH tunnel to return rule names that have deleted_at IS NOT NULL.
+    Uses LOWER() matching for case-insensitive accuracy.
+    """
     ssh_host = os.getenv("SSH_HOST", "").strip("'\"")
     ssh_user = os.getenv("SSH_USER", "").strip("'\"")
     ssh_key_path = os.getenv("SSH_KEY_PATH", "").strip("'\"")
@@ -49,10 +55,11 @@ def get_deleted_rules_set(rule_names: list[str]) -> set[str]:
 
     db_host = os.getenv("DB_HOST", "").strip("'\"")
     db_name = os.getenv("DB_NAME", "").strip("'\"")
-    db_user = os.getenv("DB_USER", "").strip("'\"")
+    db_user = os.getenv("DB_USER", "shrisha_vanga").strip("'\"")
     db_pass = os.getenv("DB_PASSWORD", "").strip("'\"")
 
     deleted_rules = set()
+    lowercased_targets = [name.lower() for name in rule_names]
 
     try:
         with open(ssh_key_path, "rb") as key_file:
@@ -83,11 +90,14 @@ def get_deleted_rules_set(rule_names: list[str]) -> set[str]:
                 with conn.cursor() as cur:
                     query = """
                         SELECT name FROM public.process_rule
-                        WHERE deleted_at IS NOT NULL AND name = ANY(%s);
+                        WHERE deleted_at IS NOT NULL AND LOWER(name) = ANY(%s);
                     """
-                    cur.execute(query, (rule_names,))
-                    for (name,) in cur.fetchall():
-                        deleted_rules.add(name)
+                    cur.execute(query, (lowercased_targets,))
+                    for (db_rule_name,) in cur.fetchall():
+                        # Map match back to blueprint rule names
+                        for orig_name in rule_names:
+                            if orig_name.lower() == db_rule_name.lower():
+                                deleted_rules.add(orig_name)
 
     except Exception as e:
         logger.error(f"Failed to check deleted rules in DB: {e}", exc_info=True)
@@ -98,7 +108,11 @@ def get_deleted_rules_set(rule_names: list[str]) -> set[str]:
 def archive_legacy_rules(blueprint_path: Path, repo_base_path: Path) -> bool:
     """Moves legacy rules from active/ to archived/ ONLY if soft-deleted in DB."""
     old_rule_names = load_old_rule_names(blueprint_path)
-    logger.info(f"Loaded {len(old_rule_names)} legacy rule name(s) from blueprint.")
+    if not old_rule_names:
+        logger.info("ℹ️ No legacy rules found in blueprint. Skipping repo archival step.")
+        return True
+
+    logger.info(f"Loaded {len(old_rule_names)} legacy rule name candidate(s) from blueprint.")
 
     # Check which rules are soft-deleted in DB
     deleted_rules = get_deleted_rules_set(old_rule_names)
@@ -117,11 +131,11 @@ def archive_legacy_rules(blueprint_path: Path, repo_base_path: Path) -> bool:
 
     for rule_name in old_rule_names:
         if rule_name not in deleted_rules:
-            logger.info(f"  ℹ️ Keeping '{rule_name}.py' in active/ (Still used by unmigrated MLSs)")
+            logger.info(f"  ℹ️ Keeping '{rule_name}.py' in active/ (Not yet soft-deleted in DB)")
             continue
 
         for item in active_dir.glob("*.py"):
-            if item.stem == rule_name or item.stem.startswith(f"{rule_name}_collision_"):
+            if item.stem.lower() == rule_name.lower() or item.stem.lower().startswith(f"{rule_name.lower()}_collision_"):
                 destination = archived_dir / item.name
                 shutil.move(str(item), str(destination))
                 logger.info(f"  📦 Archived: {item.name} ==> ui-rules/archived/{item.name}")
@@ -131,10 +145,10 @@ def archive_legacy_rules(blueprint_path: Path, repo_base_path: Path) -> bool:
     return True
 
 
-def update_processed_ledger() -> None:
-    """Appends currently processed MLS IDs from test_mls.txt to the ledger."""
-    test_mls_file = Path("temp-data/test_mls.txt")
-    ledger_file = Path("temp-data/processed_mls_ledger.json")
+def update_processed_ledger(temp_dir: Path) -> None:
+    """Appends currently processed MLS IDs from test_mls.txt to the processed ledger."""
+    test_mls_file = temp_dir / "test_mls.txt"
+    ledger_file = temp_dir / "processed_mls_ledger.json"
 
     if not test_mls_file.exists():
         return
@@ -155,32 +169,25 @@ def update_processed_ledger() -> None:
     ledger_file.parent.mkdir(parents=True, exist_ok=True)
     ledger_file.write_text(json.dumps({"completed_mls_ids": sorted(list(completed_mls))}, indent=2), encoding="utf-8")
 
-    logger.info(f"Ledger Updated: Recorded {len(current_mls)} MLS ID(s) ({', '.join(current_mls)}) in '{ledger_file}'.")
-
-
-def cleanup_temp_directories(temp_dirs: list[Path]) -> None:
-    """Removes temporary working directories after sync finishes."""
-    logger.info("Cleaning up temporary working files...")
-    for temp_dir in temp_dirs:
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
-            logger.info(f"Removed folder: '{temp_dir}'")
+    logger.info(f"✅ Ledger Updated: Recorded {len(current_mls)} MLS ID(s) ({', '.join(current_mls)}) in '{ledger_file}'.")
 
 
 def main() -> None:
-    BLUEPRINT_FILE = Path("temp-data/migration_blueprint.csv")
+    temp_dir = current_dir / "temp-data"
+    BLUEPRINT_FILE = temp_dir / "migration_blueprint.csv"
 
-    repo_base_raw = os.getenv("REPO_PATH", "")
+    repo_base_raw = os.getenv("REPO_PATH", "") or os.getenv("UI_RULES_DIR", "")
     repo_base = repo_base_raw.strip().strip("'\"")
 
     if not repo_base:
-        logger.error("REPO_PATH not set in environment.")
-        return
+        # Fallback to local sibling repo if env var is missing
+        repo_base = str(current_dir.parent / "dm-consolidated-rules")
 
     REPO_PATH = Path(repo_base)
-    TEMP_DIRS_TO_REMOVE = [Path("temp-data")]
 
-    logger.info("--- 📂 dm-consolidated-rules Archive Sync Tool ---")
+    logger.info("============================================================")
+    logger.info("📂 STAGE 8: CONSOLIDATED REPO ARCHIVE SYNC TOOL")
+    logger.info("============================================================")
     logger.info(f"Target REPO_PATH: {REPO_PATH}")
 
     success = archive_legacy_rules(BLUEPRINT_FILE, REPO_PATH)
@@ -189,12 +196,19 @@ def main() -> None:
         logger.error("Sync halted due to error.")
         return
 
-    update_processed_ledger()
+    # Update ledger prior to optional temp folder cleanup
+    update_processed_ledger(temp_dir)
 
-    confirm = input("\nDo you want to delete temporary working files ('temp-data/')? (y/N): ")
+    confirm = input("\nDo you want to delete temporary working files ('temp-data/' excluding ledger)? (y/N): ")
     if confirm.lower() == "y":
-        cleanup_temp_directories(TEMP_DIRS_TO_REMOVE)
-        logger.info("Clean complete! Workspace repository updated.")
+        # Keep ledger file intact while deleting intermediate CSVs/TXTs
+        for item in temp_dir.glob("*"):
+            if item.name != "processed_mls_ledger.json":
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item)
+        logger.info("Clean complete! Temporary working files removed (ledger preserved).")
     else:
         logger.info("Cleanup skipped. Working files retained in 'temp-data/'.")
 

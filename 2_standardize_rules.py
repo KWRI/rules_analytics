@@ -74,11 +74,16 @@ def to_pascal_case(name: str) -> str:
     for word in words:
         if not word:
             continue
-        # Preserve internal camelCase/PascalCase words (e.g., ObjectMapper)
-        if re.search(r"[a-z][A-Z]", word):
+        # Preserve internal camelCase/PascalCase words (e.g., ObjectMapper, 148Subdivision)
+        if re.search(r"[a-z][A-Z]", word) or re.search(r"\d+[A-Z]", word):
             pascal_words.append(word[0].upper() + word[1:])
         else:
-            pascal_words.append(word.capitalize())
+            # Capitalize the first letter found in the word without lowercasing subsequent letters
+            match = re.search(r"[a-zA-Z]", word)
+            if match:
+                idx = match.start()
+                word = word[:idx] + word[idx].upper() + word[idx+1:]
+            pascal_words.append(word)
 
     pascal = "".join(pascal_words)
     return f"{pascal if pascal else 'UnnamedRule'}.py"
@@ -176,7 +181,7 @@ def run_standardization():
         )
         mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
 
-        logger.info(f"Connecting to database via SSH tunnel to extract records...")
+        logger.info("Connecting to database via SSH tunnel to extract records...")
         with SSHTunnelForwarder(
                 (ssh_host, 22),
                 ssh_username=ssh_user,
