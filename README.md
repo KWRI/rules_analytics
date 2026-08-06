@@ -147,10 +147,10 @@ python 5_run_bulk_update.py --input-file raw_targeted_rules.csv --do-update
 python 6_run_bulk_promotion.py
 
 # Stage 7: Soft-delete fully unlinked legacy rules via API
-python 7_soft_delete_legacy_rules.py
+python 9_soft_delete_legacy_rules.py
 
 # Stage 8: Archive repository files & update processed ledger
-python 8_update_consolidated_repo.py
+python 10_update_consolidated_repo.py
 ```
 
 ---
