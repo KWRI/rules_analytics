@@ -1,8 +1,8 @@
 """
-Pipeline Stage 0: Two-Step High-Performance Batch Target Generator.
+Pipeline Stage 0 (API Variant): Two-Step High-Performance Batch Target Generator.
 
 Targets ONLY ACTIVE API MLS sources (mls_status_id = 2 & REST/OAuth2 protocols).
-Generates 'test_mls.txt', 'test_rules.txt', and 'batch_mls_targets.csv' based on
+Generates 'api_mls.txt', 'api_rules.txt', and 'batch_mls_targets_api.csv' based on
 a configurable MLS target limit (--limit / -l).
 
 Sorting Hierarchy:
@@ -11,9 +11,9 @@ Sorting Hierarchy:
     3. Affected MLSs ranked by integer MLS ID (ASCENDING)
 
 Usage:
-    python 0_batch_prepare.py           # Uses default limit (5 MLSs)
-    python 0_batch_prepare.py --limit 2 # Picks targets across 2 distinct MLSs
-    python 0_batch_prepare.py -l 10     # Picks targets across 10 distinct MLSs
+    python 0_prepare_api_batch_targets.py           # Uses default limit (5 MLSs)
+    python 0_prepare_api_batch_targets.py --limit 2 # Picks targets across 2 distinct MLSs
+    python 0_prepare_api_batch_targets.py -l 10     # Picks targets across 10 distinct MLSs
 """
 
 import os
@@ -38,7 +38,7 @@ warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
 current_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=current_dir / ".env")
-logger = setup_logger("Stage0_BatchPrepare")
+logger = setup_logger("Stage0_APIBatchPrepare")
 
 DEFAULT_BATCH_MLS_LIMIT = 5
 TEMP_DATA_DIR = current_dir / "temp-data"
@@ -74,7 +74,7 @@ def load_processed_mls() -> set[int]:
 def generate_batch(mls_limit: int):
     """
     Selects up to `mls_limit` distinct active API MLS sources starting from the
-    lowest-impact legacy rules, and writes test_mls.txt, test_rules.txt, and batch_mls_targets.csv.
+    lowest-impact legacy rules, and writes api_mls.txt, api_rules.txt, and batch_mls_targets_api.csv.
     """
     ssh_host = os.getenv("SSH_HOST", "").strip("'\"")
     ssh_user = os.getenv("SSH_USER", "").strip("'\"")
@@ -88,7 +88,7 @@ def generate_batch(mls_limit: int):
 
     already_processed_mls = load_processed_mls()
     logger.info(f"Loaded {len(already_processed_mls)} previously processed MLS ID(s) from ledger.")
-    logger.info(f"Target MLS batch size limit: {mls_limit}")
+    logger.info(f"Target MLS batch size limit: {mls_limit} (API/REST/OAuth2 Filter)")
 
     try:
         with open(ssh_key_path, "rb") as key_file:
@@ -179,12 +179,12 @@ def generate_batch(mls_limit: int):
                         return
 
                     target_mls_list = sorted(list(selected_mls_set))
-                    logger.info(f"Selected target MLS IDs ({len(target_mls_list)}): {target_mls_list}")
+                    logger.info(f"Selected target API MLS IDs ({len(target_mls_list)}): {target_mls_list}")
 
                     # -------------------------------------------------------------
                     # QUERY 2: Fetch detailed metadata for ALL legacy rules on selected MLSs
                     # -------------------------------------------------------------
-                    logger.info("Step 2: Fetching granular metadata for target MLS sources...")
+                    logger.info("Step 2: Fetching granular metadata for target API MLS sources...")
                     query_2 = """
                         SELECT DISTINCT
                             pr.name AS legacy_rule_name,
@@ -247,12 +247,13 @@ def generate_batch(mls_limit: int):
         # Write output files into temp-data/
         TEMP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-        test_mls_path = TEMP_DATA_DIR / "test_mls.txt"
-        test_rules_path = TEMP_DATA_DIR / "test_rules.txt"
-        batch_targets_csv_path = TEMP_DATA_DIR / "batch_mls_targets.csv"
+        api_mls_path = TEMP_DATA_DIR / "api_mls.txt"
+        api_rules_path = TEMP_DATA_DIR / "api_rules.txt"
+        api_targets_csv_path = TEMP_DATA_DIR / "batch_mls_targets_api.csv"
+        working_targets_csv_path = TEMP_DATA_DIR / "batch_mls_targets.csv"
 
-        test_mls_path.write_text("\n".join(str(m) for m in target_mls_list) + "\n", encoding="utf-8")
-        test_rules_path.write_text("\n".join(final_sorted_rules) + "\n", encoding="utf-8")
+        api_mls_path.write_text("\n".join(str(m) for m in target_mls_list) + "\n", encoding="utf-8")
+        api_rules_path.write_text("\n".join(final_sorted_rules) + "\n", encoding="utf-8")
 
         csv_headers = [
             "mls_id",
@@ -264,33 +265,36 @@ def generate_batch(mls_limit: int):
             "legacy_rule_name"
         ]
 
-        with open(batch_targets_csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=csv_headers)
-            writer.writeheader()
-            for rec in sorted_csv_records:
-                writer.writerow({k: rec[k] for k in csv_headers})
+        # Write both batch_mls_targets_api.csv and batch_mls_targets.csv
+        for csv_path in [api_targets_csv_path, working_targets_csv_path]:
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=csv_headers)
+                writer.writeheader()
+                for rec in sorted_csv_records:
+                    writer.writerow({k: rec[k] for k in csv_headers})
 
         logger.info("============================================================")
-        logger.info("🎯 AUTOMATED BATCH SELECTION COMPLETE")
+        logger.info("🎯 AUTOMATED API BATCH SELECTION COMPLETE")
         logger.info("============================================================")
         logger.info(f"Target MLS IDs ({len(target_mls_list)}): {', '.join(str(m) for m in target_mls_list)}")
         logger.info(f"Target Rules ({len(final_sorted_rules)}): {', '.join(final_sorted_rules)}")
-        logger.info(f"Generated: {test_mls_path}")
-        logger.info(f"Generated: {test_rules_path}")
-        logger.info(f"Generated: {batch_targets_csv_path}")
+        logger.info(f"Generated: {api_mls_path}")
+        logger.info(f"Generated: {api_rules_path}")
+        logger.info(f"Generated: {api_targets_csv_path}")
+        logger.info(f"Updated Working Target: {working_targets_csv_path}")
         logger.info("============================================================")
 
     except Exception as e:
-        logger.error(f"Batch preparation failed: {e}", exc_info=True)
+        logger.error(f"API Batch preparation failed: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Automated Batch Target Generator (MLS Limit)")
+    parser = argparse.ArgumentParser(description="Automated API Batch Target Generator (MLS Limit)")
     parser.add_argument(
         "-l", "--limit",
         type=int,
         default=DEFAULT_BATCH_MLS_LIMIT,
-        help=f"Number of MLS sources to process in this batch (default: {DEFAULT_BATCH_MLS_LIMIT})"
+        help=f"Number of API MLS sources to process in this batch (default: {DEFAULT_BATCH_MLS_LIMIT})"
     )
     args = parser.parse_args()
 

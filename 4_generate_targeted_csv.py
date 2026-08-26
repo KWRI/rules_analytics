@@ -7,7 +7,8 @@ JSON property and mapping schema trees to target active rule mutations. It then 
 comprehensive database layout configuration map to 'temp-data/raw_targeted_rules.csv' and aggregates
 a numerically sorted, unique integer list of affected IDs to 'temp-data/promotion_sources.txt'.
 
-Supports target MLS batch testing mode via 'temp-data/test_mls.txt' (via rules_utils.py).
+Supports target MLS batch mode via 'temp-data/api_mls.txt' and/or 'temp-data/rets_mls.txt'
+(via rules_utils.py).
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
@@ -24,7 +25,7 @@ from sshtunnel import SSHTunnelForwarder
 from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
 
-from rules_utils import load_target_test_mls
+from rules_utils import load_target_mls
 from pipeline_logger import setup_logger
 
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
@@ -104,10 +105,10 @@ def run_production_extractor():
         logger.error("Stage 2 assets missing. Please execute Stage 2 standardization first.")
         return
 
-    # Check for target MLS batch testing file via rules_utils.py
-    target_mls_set = load_target_test_mls(temp_data_dir)
-    if target_mls_set:
-        logger.info(f"🧪 [MLS BATCH FILTER] Targeting {len(target_mls_set)} specified MLS ID(s): {sorted(list(target_mls_set))}")
+    # Check for target MLS batch files via rules_utils.py
+    target_batch_mls = load_target_mls(temp_data_dir)
+    if target_batch_mls:
+        logger.info(f"🎯 [MLS BATCH TARGET] Targeting {len(target_batch_mls)} specified MLS ID(s): {sorted(list(target_batch_mls))}")
     else:
         logger.info("🚀 [FULL MODE] Executing extraction across ALL active MLS configurations...")
 
@@ -225,10 +226,10 @@ def run_production_extractor():
                                 is_enabled, raw_properties, raw_mapping_fields
                             ) = row
 
-                            # Filter out records if test_mls.txt is actively targeting specific MLS IDs
-                            if target_mls_set and mls_id is not None:
+                            # Filter out records if api_mls.txt or rets_mls.txt is actively targeting specific MLS IDs
+                            if target_batch_mls and mls_id is not None:
                                 try:
-                                    if int(mls_id) not in target_mls_set:
+                                    if int(mls_id) not in target_batch_mls:
                                         continue
                                 except ValueError:
                                     continue

@@ -1,5 +1,5 @@
 """
-Stage 7: Soft Delete Legacy Rules Script (With Active Reference Safety Guard)
+Stage 9: Soft Delete Legacy Rules Script (With Active Reference Safety Guard)
 
 Parses 'temp-data/migration_blueprint.csv' and checks the staging database to ensure
 that targeted legacy rules are NOT currently in use by other unmigrated MLS sources.
@@ -13,6 +13,7 @@ API Specification:
 import os
 import io
 import sys
+import argparse
 import requests
 import pandas as pd
 import psycopg2
@@ -26,9 +27,9 @@ from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=current_dir / ".env")
-logger = setup_logger("Stage7_SoftDelete")
+logger = setup_logger("Stage9_SoftDelete")
 
-API_BASE_URL = os.getenv("MLS_ADMIN_API_URL", "https://stage-ext-ms.data.kw.com")
+API_BASE_URL = os.getenv("MLS_ADMIN_API_URL", "https://stage-ext-ms.data.kw.com").strip().strip("'\"").rstrip("/")
 API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
 DELETED_BY_USER = os.getenv("UPDATED_BY_USER") or os.getenv("DB_USER", "shrisha_vanga")
 
@@ -38,17 +39,18 @@ HEADERS = {
 }
 
 
-def load_old_rule_names_from_blueprint(blueprint_path: str) -> list[str]:
+def load_old_rule_names_from_blueprint(blueprint_path: Path) -> list[str]:
     """Parses the migration blueprint file and extracts unique legacy rule names."""
-    if not os.path.exists(blueprint_path):
-        logger.error(f"Blueprint file not found at '{blueprint_path}'")
+    if not blueprint_path.exists():
+        logger.error(f"❌ Blueprint file not found at '{blueprint_path}'. Aborting.")
         sys.exit(1)
 
-    df = pd.read_csv(blueprint_path) if blueprint_path.endswith(".csv") else pd.read_excel(blueprint_path)
+    path_str = str(blueprint_path)
+    df = pd.read_csv(path_str) if path_str.endswith(".csv") else pd.read_excel(path_str)
 
     column_name = "old_name"
     if column_name not in df.columns:
-        logger.error(f"Column '{column_name}' not found in '{blueprint_path}'.")
+        logger.error(f"❌ Column '{column_name}' not found in '{blueprint_path}'. Aborting.")
         sys.exit(1)
 
     # Filter out empty or null legacy names
@@ -74,6 +76,10 @@ def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
 
     usage_counts = {name: 0 for name in rule_names}
     lowercased_targets = [name.lower() for name in rule_names]
+
+    if not ssh_host or not ssh_key_path:
+        logger.error("❌ SSH parameters missing from .env file. Unable to verify DB dependencies.")
+        sys.exit(1)
 
     try:
         with open(ssh_key_path, "rb") as key_file:
@@ -122,49 +128,54 @@ def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
                                 usage_counts[orig_name] += count
 
     except Exception as e:
-        logger.error(f"Failed to verify active rule usage from DB: {e}", exc_info=True)
+        logger.error(f"❌ Failed to verify active rule usage from DB: {e}", exc_info=True)
+        sys.exit(1)
 
     return usage_counts
 
 
 def delete_rule_via_api(rule_name: str, deleted_by: str) -> bool:
-    """Sends a DELETE request matching the exact Swagger curl call."""
-    url = f"{API_BASE_URL.rstrip('/')}/v1/mls-admin/rules"
+    """Sends a DELETE request matching the exact Swagger API contract."""
+    url = f"{API_BASE_URL}/v1/mls-admin/rules"
     params = {"name": rule_name, "deleted_by": deleted_by}
 
     try:
-        response = requests.delete(url, headers=HEADERS, params=params, timeout=10)
+        response = requests.delete(url, headers=HEADERS, params=params, timeout=15)
         if response.status_code in (200, 204):
             try:
                 data = response.json()
                 rule_id = data.get("id", "N/A")
             except Exception:
                 rule_id = "N/A"
-            logger.info(f"✅ Soft-deleted rule: '{rule_name}' (ID: {rule_id}, by {deleted_by})")
+            logger.info(f"   ✅ Soft-deleted rule: '{rule_name}' (ID: {rule_id}, by {deleted_by})")
             return True
         else:
-            logger.error(f"❌ Failed for '{rule_name}' [HTTP {response.status_code}]: {response.text}")
+            logger.error(f"   ❌ Failed for '{rule_name}' [HTTP {response.status_code}]: {response.text}")
             return False
     except requests.RequestException as e:
-        logger.error(f"❌ Request exception for '{rule_name}': {e}", exc_info=True)
+        logger.error(f"   ❌ Request exception for '{rule_name}': {e}", exc_info=True)
         return False
 
 
 def main() -> None:
-    BLUEPRINT_FILE = current_dir / "temp-data" / "migration_blueprint.csv"
+    parser = argparse.ArgumentParser(description="Soft delete legacy rules unlinked from active MLS sources.")
+    parser.add_argument("-y", "--force", action="store_true", help="Auto-confirm soft deletion without user prompt.")
+    args = parser.parse_args()
+
+    blueprint_file = current_dir / "temp-data" / "migration_blueprint.csv"
     logger.info("============================================================")
-    logger.info("🗑️ STAGE 7: MLS ADMIN MICROSERVICE SAFE SOFT DELETE TOOL")
+    logger.info("🗑️ STAGE 9: MLS ADMIN MICROSERVICE SAFE SOFT DELETE TOOL")
     logger.info("============================================================")
 
-    rule_names = load_old_rule_names_from_blueprint(str(BLUEPRINT_FILE))
+    rule_names = load_old_rule_names_from_blueprint(blueprint_file)
     if not rule_names:
         logger.info("ℹ️ No legacy rules ('old_name') found in blueprint. Nothing to delete.")
         return
 
-    logger.info(f"Loaded {len(rule_names)} legacy rule candidate(s) from migration blueprint.")
+    logger.info(f"📄 Loaded {len(rule_names)} legacy rule candidate(s) from migration blueprint.")
 
     # Check active usage across remaining MLS sources
-    logger.info("Verifying active rule dependencies across unmigrated MLS sources...")
+    logger.info("🔍 Verifying active rule dependencies across unmigrated MLS sources...")
     usage_counts = get_active_rule_usage_counts(rule_names)
 
     rules_to_delete = []
@@ -190,19 +201,24 @@ def main() -> None:
     for idx, name in enumerate(rules_to_delete, 1):
         logger.info(f"   {idx}. {name}")
 
-    confirm = input(f"\nConfirm soft-deletion of {len(rules_to_delete)} unlinked rule(s)? (y/N): ")
-    if confirm.lower() != "y":
-        logger.info("Operation cancelled by user.")
-        return
+    if not args.force:
+        if not sys.stdin.isatty():
+            logger.warning("⚠️ Non-interactive session detected without --force flag. Aborting for safety.")
+            return
 
-    logger.info("Starting API deletion sequence...")
+        confirm = input(f"\nConfirm soft-deletion of {len(rules_to_delete)} unlinked rule(s)? (y/N): ")
+        if confirm.lower() != "y":
+            logger.info("Operation cancelled by user.")
+            return
+
+    logger.info("🚀 Starting API deletion sequence...")
     success_count = 0
     for name in rules_to_delete:
         if delete_rule_via_api(name, DELETED_BY_USER):
             success_count += 1
 
     logger.info("============================================================")
-    logger.info(f"🚀 STAGE 7 FINISHED: Soft-deleted {success_count}/{len(rules_to_delete)} rule(s) via API.")
+    logger.info(f"✅ STAGE 9 FINISHED: Soft-deleted {success_count}/{len(rules_to_delete)} rule(s) via API.")
     logger.info("============================================================")
 
 

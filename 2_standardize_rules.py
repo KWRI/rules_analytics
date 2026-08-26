@@ -5,7 +5,8 @@ Parses extracted staging records and compiles rule identifiers into a standardiz
 PascalCase naming format. Concurrently writes transformed rule files to target
 directories and outputs a workspace mapping ledger (migration_blueprint.csv).
 
-Supports target batch testing mode via 'temp-data/test_rules.txt' using rules_utils.py.
+Supports target batch mode by dynamically reading 'temp-data/api_rules.txt' and/or
+'temp-data/rets_rules.txt' using rules_utils.py.
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
@@ -26,7 +27,7 @@ from sshtunnel import SSHTunnelForwarder
 from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
 
-from rules_utils import load_target_test_rules
+from rules_utils import load_target_rules
 from pipeline_logger import setup_logger
 
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
@@ -68,6 +69,18 @@ def to_pascal_case(name: str) -> str:
     base_name = re.sub(r"[\(\)\[\]\{\}]", "", base_name)
     base_name = re.sub(r"[/|\\]|__", " ", base_name)
 
+    # Special Case tuple list: [(old_name, new_name)]
+    special_cases = [
+        ("strtonumber", "StrToNumber"),
+        ("148subdivision", "148Subdivision"),
+        ("470hoa", "470Hoa"),
+    ]
+
+    cleaned_name = base_name.lower().strip()
+    for old_name, new_name in special_cases:
+        if cleaned_name == old_name.lower():
+            return f"{new_name}.py"
+
     words = re.split(r"[\s_-]+", base_name)
 
     pascal_words = []
@@ -78,7 +91,6 @@ def to_pascal_case(name: str) -> str:
         if re.search(r"[a-z][A-Z]", word) or re.search(r"\d+[A-Z]", word):
             pascal_words.append(word[0].upper() + word[1:])
         else:
-            # Capitalize the first letter found in the word without lowercasing subsequent letters
             match = re.search(r"[a-zA-Z]", word)
             if match:
                 idx = match.start()
@@ -125,12 +137,12 @@ def run_standardization():
     temp_data_dir = project_dir / "temp-data"
     temp_data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check for target batch test file or single rule env var
-    target_test_rules = load_target_test_rules(temp_data_dir)
-    env_test_rule = os.getenv("TEST_RULE_NAME", "").strip().strip("'\"") or None
+    # Union of rules from api_rules.txt and rets_rules.txt
+    target_batch_rules = load_target_rules(temp_data_dir)
+    env_target_rule = os.getenv("TARGET_RULE_NAME", "").strip().strip("'\"") or None
 
-    if env_test_rule:
-        target_test_rules.add(env_test_rule)
+    if env_target_rule:
+        target_batch_rules.add(env_target_rule)
 
     target_base_dir = Path(repo_path) / "standard-rule-names"
     target_active_dir = target_base_dir / "active"
@@ -196,14 +208,14 @@ def run_standardization():
                     port=tunnel.local_bind_port,
             ) as conn:
                 with conn.cursor() as cur:
-                    if target_test_rules:
-                        logger.info(f"🧪 [BATCH TEST MODE] Targeting {len(target_test_rules)} rule(s)...")
+                    if target_batch_rules:
+                        logger.info(f"🎯 [TARGET BATCH MODE] Targeting {len(target_batch_rules)} rule(s)...")
                         select_query = """
                             SELECT id, name, content, description, params, "order", created_at, deleted_at 
                             FROM public.process_rule
                             WHERE name = ANY(%s);
                         """
-                        cur.execute(select_query, (list(target_test_rules),))
+                        cur.execute(select_query, (list(target_batch_rules),))
                     else:
                         logger.info("🚀 [FULL PRODUCTION MODE] Pulling all process_rule records...")
                         select_query = """
@@ -213,8 +225,8 @@ def run_standardization():
                         cur.execute(select_query)
 
                     rows = cur.fetchall()
-                    if not rows and target_test_rules:
-                        logger.warning("No records found matching target test rule names.")
+                    if not rows and target_batch_rules:
+                        logger.warning("No records found matching target rule names.")
 
                     for row in rows:
                         _, old_name, content, _, _, _, created_at, deleted_at = row[:8]
@@ -306,7 +318,7 @@ def run_standardization():
     logger.info("============================================================")
     logger.info("🚀 PHASE 2 COMPLETE: HIGH-SPEED CASE-INSENSITIVE COMPILER")
     logger.info("============================================================")
-    logger.info(f"Mode                                     : {'BATCH TEST (' + str(len(target_test_rules)) + ' rules)' if target_test_rules else 'FULL PRODUCTION'}")
+    logger.info(f"Mode                                     : {'TARGET BATCH (' + str(len(target_batch_rules)) + ' rules)' if target_batch_rules else 'FULL PRODUCTION'}")
     logger.info(f"Standardized Active Rules Written        : {active_copied_count}")
     logger.info(f"Standardized Archived Rules Written      : {archived_copied_count}")
     logger.info(f"Unified (Active + Deleted) Rows in CSV   : {len(csv_rows)}")

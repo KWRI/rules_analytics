@@ -5,8 +5,8 @@ Parses 'temp-data/migration_blueprint.csv' and registers newly standardized Pasc
 rules via the MLS Admin Microservice (`POST /rules`). This automatically handles Snowflake ID
 generation, populates language/group associations, and immediately invalidates UI caches.
 
-Supports target batch testing mode via 'temp-data/test_rules.txt' (via rules_utils.py)
-or single-rule testing mode via the `TEST_RULE_NAME` env variable.
+Supports target batch mode via 'temp-data/api_rules.txt' and/or 'temp-data/rets_rules.txt'
+(via rules_utils.py) or single-rule mode via the `TARGET_RULE_NAME` env variable.
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
@@ -23,7 +23,7 @@ from sshtunnel import SSHTunnelForwarder
 from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
 
-from rules_utils import load_target_test_rules
+from rules_utils import load_target_rules
 from pipeline_logger import setup_logger
 
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
@@ -56,12 +56,12 @@ def register_rules_via_microservice():
     stage_url = stage_url_raw.strip().strip("'\"").rstrip("/")
     rules_endpoint = f"{stage_url}/rules"
 
-    # Check for target batch test file or single rule env var
-    target_test_rules = load_target_test_rules(temp_data_dir)
-    env_test_rule = os.getenv("TEST_RULE_NAME", "").strip().strip("'\"") or None
+    # Check for target batch files or single rule env var
+    target_batch_rules = load_target_rules(temp_data_dir)
+    env_target_rule = os.getenv("TARGET_RULE_NAME", "").strip().strip("'\"") or None
 
-    if env_test_rule:
-        target_test_rules.add(env_test_rule)
+    if env_target_rule:
+        target_batch_rules.add(env_target_rule)
 
     # Parse blueprint matrix
     migrations_to_execute = []
@@ -73,8 +73,8 @@ def register_rules_via_microservice():
                 old_name, target_new_name = row[0].strip(), row[1].strip()
                 clean_new_name = target_new_name[:-3] if target_new_name.endswith(".py") else target_new_name
 
-                # Filter by test_rules.txt or TEST_RULE_NAME if present
-                if target_test_rules and old_name not in target_test_rules:
+                # Filter by targeted batch rules if present
+                if target_batch_rules and old_name not in target_batch_rules:
                     continue
 
                 if old_name != clean_new_name:
@@ -84,8 +84,8 @@ def register_rules_via_microservice():
         logger.info("No pending migration entries found to insert.")
         return
 
-    if target_test_rules:
-        logger.info(f"🧪 [BATCH TEST MODE] Targeting {len(migrations_to_execute)} rule(s)...")
+    if target_batch_rules:
+        logger.info(f"🎯 [TARGET BATCH MODE] Targeting {len(migrations_to_execute)} rule(s)...")
     else:
         logger.info(f"🚀 [FULL PRODUCTION MODE] Registering {len(migrations_to_execute)} rules via microservice...")
 

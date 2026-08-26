@@ -1,46 +1,63 @@
 """
-Stage 6: Bulk Production Promotion Engine
+Stage 6: Bulk Production Promotion Engine (API Variant)
 
 Automatically handles the entire pre-promotion and promotion lifecycle:
-1. Disables MLS Download Jobs for active targets via API.
-2. Triggers Download Manager Scheduler Sync via API.
+1. Disables MLS Download Jobs for active targets via Production API.
+2. Triggers Download Manager Scheduler Sync via Production API.
 3. Stages production manifest file on the remote deployment server over SSH/SFTP.
 4. Executes remote shell commands to promote rules, maps, and metadata to Production.
 """
 
 import os
 import sys
+import io
 import time
 import requests
 import paramiko
 from pathlib import Path
 from dotenv import load_dotenv
+from cryptography.hazmat.primitives import serialization
 
-from rules_utils import load_target_test_mls
+from rules_utils import load_target_mls
 from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage6_BulkPromotion")
 
-# API & SSH ENVIRONMENT CONSTANTS
-PROD_BASE_URL = os.getenv("PROD_MS_URL", "https://prod-ext-ms.data.kw.com").rstrip("/")
-API_BASE_URL = os.getenv("MLS_ADMIN_API_BASE_URL", f"{PROD_BASE_URL}/v1/mls-admin")
+# ============================================================
+# API & SSH ENVIRONMENT CONSTANTS (EXPLICIT PROD TARGETING)
+# ============================================================
+MLS_ADMIN_PROD_URL = os.getenv(
+    "MLS_ADMIN_PROD_URL",
+    "https://prod-ext-ms.data.kw.com/v1/mls-admin"
+).strip().strip("'\"").rstrip("/")
+
+PROD_BASE_URL = os.getenv(
+    "PROD_MS_URL",
+    MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0]
+).strip().strip("'\"").rstrip("/")
+
+API_BASE_URL = MLS_ADMIN_PROD_URL
 API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
 UPDATED_BY_USER = os.getenv("UPDATED_BY_USER", "shrisha.vanga@kw.com")
 
-SSH_HOST = os.getenv("REMOTE_SSH_HOST", "sdh.data.kw.com").strip("'\"")
-SSH_USER = os.getenv("REMOTE_SSH_USER", "").strip("'\"")
-SSH_KEY_PATH = os.getenv("REMOTE_SSH_KEY_PATH", "").strip("'\"")
-SSH_PASSPHRASE = os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "").strip("'\"")
-REMOTE_MANIFEST_PATH = os.getenv("REMOTE_MANIFEST_PATH", "/eim-mls-admin-ms/devtools/source_promotion/promotion_sources.txt")
+# Robust variable resolution with fallbacks for .env naming variations
+SSH_HOST = (os.getenv("REMOTE_SSH_HOST") or os.getenv("REMOTE_HOST", "sdh.data.kw.com")).strip("'\"")
+SSH_USER = (os.getenv("REMOTE_SSH_USER") or os.getenv("SSH_USER", "")).strip("'\"")
+SSH_KEY_PATH = (os.getenv("REMOTE_SSH_KEY_PATH") or os.getenv("SSH_KEY_PATH", "")).strip("'\"")
+SSH_PASSPHRASE = (os.getenv("REMOTE_SSH_KEY_PASSPHRASE") or os.getenv("SSH_KEY_PASSPHRASE", "")).strip("'\"")
+REMOTE_MANIFEST_PATH = os.getenv(
+    "REMOTE_MANIFEST_PATH",
+    "/eim-mls-admin-ms/devtools/source_promotion/promotion_sources.txt"
+)
 
 
 def get_target_mls_ids() -> list[int]:
     """Resolves target MLS IDs from local batch artifacts."""
     temp_data_dir = current_dir / "temp-data"
 
-    target_set = load_target_test_mls(temp_data_dir)
+    target_set = load_target_mls(temp_data_dir)
     if target_set:
         return sorted([int(m) for m in target_set])
 
@@ -59,9 +76,9 @@ def get_target_mls_ids() -> list[int]:
 # ============================================================
 
 def trigger_scheduler_sync() -> bool:
-    """Triggers Download Manager Scheduler Sync POST call."""
+    """Triggers Download Manager Scheduler Sync POST call on Production."""
     sync_url = f"{PROD_BASE_URL}/v1/download-manager/scheduler/sync"
-    logger.info("🔄 ACTION: TRIGGER DOWNLOAD MANAGER SCHEDULER SYNC")
+    logger.info("🔄 ACTION: TRIGGER PRODUCTION DOWNLOAD MANAGER SCHEDULER SYNC")
     logger.info(f"Target Endpoint : {sync_url}")
 
     headers = {
@@ -84,7 +101,7 @@ def trigger_scheduler_sync() -> bool:
 
 
 def pre_promotion_disable_and_sync(mls_ids: list[int]) -> bool:
-    """Disables MLS Download Jobs for target sources and triggers scheduler sync."""
+    """Disables MLS Download Jobs for target sources on Production and triggers scheduler sync."""
     logger.info("============================================================")
     logger.info("🛑 PRE-PROMOTION STEP: DISABLING JOBS & SYNCING SCHEDULER")
     logger.info("============================================================")
@@ -140,10 +157,10 @@ def main() -> None:
 
     mls_ids = get_target_mls_ids()
     if not mls_ids:
-        logger.error("❌ No target MLS IDs found in temp-data/ (checked test_mls.txt and promotion_sources.txt). Aborting.")
+        logger.error("❌ No target MLS IDs found in temp-data/ (checked api_mls.txt and promotion_sources.txt). Aborting.")
         sys.exit(1)
 
-    logger.info(f"🧪 [PROMOTION BATCH GUARD] Active MLS targets detected: {mls_ids}")
+    logger.info(f"🎯 [PROMOTION BATCH GUARD] Active MLS targets detected: {mls_ids}")
 
     # ------------------------------------------------------------
     # 1. RUN PRE-PROMOTION DISABLE & SCHEDULER SYNC
@@ -167,11 +184,26 @@ def main() -> None:
     logger.info("============================================================")
     logger.info(f"[1/4] Connecting to remote host {SSH_HOST}...")
 
-    ssh_key = paramiko.RSAKey.from_private_key_file(SSH_KEY_PATH, password=SSH_PASSPHRASE if SSH_PASSPHRASE else None)
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    if not SSH_KEY_PATH:
+        logger.error("❌ SSH key path missing from configuration! Check REMOTE_SSH_KEY_PATH or SSH_KEY_PATH in .env.")
+        sys.exit(1)
 
     try:
+        # Load OpenSSH / PEM key dynamically using cryptography
+        with open(SSH_KEY_PATH, "rb") as key_file:
+            private_key = serialization.load_pem_private_key(
+                key_file.read(),
+                password=SSH_PASSPHRASE.encode() if SSH_PASSPHRASE else None,
+            )
+        pem_data = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        ssh_key = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
+
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(hostname=SSH_HOST, username=SSH_USER, pkey=ssh_key, timeout=15)
 
         logger.info(f"[2/4] Uploading manifest to server path: {REMOTE_MANIFEST_PATH}...")
@@ -189,31 +221,50 @@ def main() -> None:
             logger.info(f"   Targeted MLS ID: {source_id}")
 
         # ------------------------------------------------------------
-        # 3. INTERACTIVE SHELL PROMOTION SEQUENCE
+        # 3. INTERACTIVE SHELL PROMOTION SEQUENCE (DYNAMIC TIMEOUT)
         # ------------------------------------------------------------
         logger.info("[4/4] Invoking production rule migration engine sequentially...")
         shell = ssh.invoke_shell()
         time.sleep(2)
 
-        # Commands to execute in interactive shell
-        commands = [
-            "s_p",
-            "set_promotion stage prod",
-            f"while IFS= read -r i; do echo 'Processing ID: '$i; python promote_source.py -s process \"$i\" -y; done < {REMOTE_MANIFEST_PATH}",
-            "exit"
-        ]
-
-        logger.info("--- PRODUCTION SHELL INTERACTION OUTPUT LOGS ---")
-        for cmd in commands:
-            logger.info(f"[INPUT] Sending interactive shell input: {cmd}")
+        # Environment setup commands
+        init_commands = ["s_p", "set_promotion stage prod"]
+        for cmd in init_commands:
+            logger.info(f"[INPUT] Sending setup command: {cmd}")
             shell.send(cmd + "\n")
             time.sleep(3)
-
             while shell.recv_ready():
                 output = shell.recv(4096).decode("utf-8", errors="ignore")
                 for line in output.splitlines():
                     if line.strip():
                         logger.info(f"[REMOTE SHELL] {line}")
+
+        # Send execution loop
+        loop_cmd = f'while IFS= read -r i; do echo "Processing ID: "$i; python promote_source.py -s process "$i" -y; done < {REMOTE_MANIFEST_PATH}'
+        logger.info(f"[INPUT] Sending batch promotion loop: {loop_cmd}")
+        shell.send(loop_cmd + "\n")
+
+        # Dynamic output listener: continuously polls output until execution finishes completely
+        logger.info("--- PRODUCTION SHELL INTERACTION OUTPUT LOGS ---")
+        idle_count = 0
+        while True:
+            if shell.recv_ready():
+                idle_count = 0
+                output = shell.recv(8192).decode("utf-8", errors="ignore")
+                for line in output.splitlines():
+                    if line.strip():
+                        logger.info(f"[REMOTE SHELL] {line}")
+            else:
+                time.sleep(2)
+                idle_count += 1
+                # Wait for 12 seconds of total remote shell silence before considering execution complete
+                if idle_count >= 6:
+                    break
+
+        # Send exit command ONLY after remote promotion has concluded
+        logger.info("[INPUT] Remote promotion complete. Closing shell session...")
+        shell.send("exit\n")
+        time.sleep(2)
 
         ssh.close()
         logger.info("---------------------------------------------------")

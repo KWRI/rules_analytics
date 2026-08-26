@@ -6,7 +6,8 @@ It supports safe evaluation passes via a validation simulation mode (`--debug`) 
 dry-run traces without mutating records. When executed with live parameters (`--do-update`), it mutates
 the nested configuration nodes in the Staging database to reflect the new PascalCase specifications.
 
-Supports target MLS batch testing notice via 'temp-data/test_mls.txt' (via rules_utils.py).
+Supports target MLS batch notice via 'temp-data/api_mls.txt' and/or 'temp-data/rets_mls.txt'
+(via rules_utils.py).
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
@@ -16,7 +17,7 @@ import importlib.util
 from pathlib import Path
 from dotenv import load_dotenv
 
-from rules_utils import load_target_test_mls
+from rules_utils import load_target_mls
 from pipeline_logger import setup_logger
 
 logger = setup_logger("Stage5_BulkUpdate")
@@ -92,11 +93,11 @@ except Exception as e:
 
 if __name__ == "__main__":
     try:
-        # Check if MLS batch target active in temp-data/test_mls.txt
+        # Check if MLS batch target is active in temp-data/
         temp_data_dir = Path(current_dir) / "temp-data"
-        target_mls_set = load_target_test_mls(temp_data_dir)
-        if target_mls_set:
-            logger.info(f"🧪 [STAGING BULK UPDATE GUARD] Active MLS targets detected: {sorted(list(target_mls_set))}")
+        target_batch_mls = load_target_mls(temp_data_dir)
+        if target_batch_mls:
+            logger.info(f"🎯 [STAGING BULK UPDATE GUARD] Active MLS targets detected: {sorted(list(target_batch_mls))}")
 
         import bulk_map_tool
 
