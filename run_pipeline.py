@@ -1,7 +1,7 @@
 """
 Master Migration Pipeline Orchestrator.
 
-Sequentially executes Stages 0 through 10 with built-in error handling,
+Sequentially executes Stages 0 through 11 with built-in error handling,
 dry-run verification gates, timing pause prompts, and user confirmation steps.
 
 Usage:
@@ -24,9 +24,9 @@ logger = setup_logger("MasterPipeline")
 def run_stage(script_name: str, args: list[str] = None) -> bool:
     """Executes a pipeline script as a subprocess."""
     cmd = [sys.executable, script_name] + (args or [])
-    logger.info(f"\n============================================================")
+    logger.info("============================================================")
     logger.info(f"🚀 EXECUTING: {' '.join(cmd)}")
-    logger.info(f"============================================================")
+    logger.info("============================================================")
 
     result = subprocess.run(cmd)
 
@@ -69,7 +69,7 @@ def main() -> None:
         "--wait-mins",
         type=int,
         default=5,
-        help="Minutes to wait for BigQuery logs after Stage 7 (default: 5)"
+        help="Minutes to wait for BigQuery logs after Stage 8 (default: 5)"
     )
     args = parser.parse_args()
 
@@ -77,32 +77,35 @@ def main() -> None:
     logger.info("🏁 STARTING AUTOMATED MLS MIGRATION PIPELINE")
     logger.info("============================================================")
 
-    # Stage 0: Prepare Batch Targets
-    if not run_stage("0_prepare_batch_targets_api.py", ["--limit", str(args.limit)]):
-        sys.exit(1)
+    # ------------------------------------------------------------
+    # STAGE 0: Prepare Batch Targets (API & RETS)
+    # ------------------------------------------------------------
+    run_stage("0_prepare_batch_targets_api.py", ["--limit", str(args.limit)])
+    run_stage("0_prepare_batch_targets_rets.py", ["--limit", str(args.limit)])
 
-    test_mls_file = Path("temp-data/api_mls.txt")
-    if not test_mls_file.exists() or not test_mls_file.read_text().strip():
+    api_batch = Path("temp-data/batch_mls_targets_api.csv")
+    rets_batch = Path("temp-data/batch_mls_targets_rets.csv")
+
+    if (not api_batch.exists() or not api_batch.read_text().strip()) and \
+       (not rets_batch.exists() or not rets_batch.read_text().strip()):
         logger.info("🎉 No unmigrated rules/MLSs remaining! Pipeline finished early.")
         sys.exit(0)
 
-    # Stage 1: Database Baseline Ingress Sync
+    # ------------------------------------------------------------
+    # STAGES 1 TO 5: Staging Transformation & Bulk Updates
+    # ------------------------------------------------------------
     if not run_stage("1_sync_database_to_repo.py"):
         sys.exit(1)
 
-    # Stage 2: PascalCase Standardizer & Blueprint Compiler
     if not run_stage("2_standardize_rules.py"):
         sys.exit(1)
 
-    # Stage 3: Microservice Rule Registration
     if not run_stage("3_inserting_new_rule.py"):
         sys.exit(1)
 
-    # Stage 4: Property Schema Extraction & Targeted Payload Generator
     if not run_stage("4_generate_targeted_csv.py"):
         sys.exit(1)
 
-    # Stage 5: Staging Bulk Database Mutation
     logger.info("Running Stage 5 in DRY-RUN (--debug) mode for safety verification...")
     if not run_stage("5_run_bulk_update.py", ["--input-file", "temp-data/raw_targeted_rules.csv", "--debug"]):
         sys.exit(1)
@@ -115,22 +118,37 @@ def main() -> None:
     if not run_stage("5_run_bulk_update.py", ["--input-file", "temp-data/raw_targeted_rules.csv", "--do-update"]):
         sys.exit(1)
 
-    # Stage 6: Production Environment Promotion
+    # ------------------------------------------------------------
+    # STAGE 6: Disable Ingestion Jobs Prior to Production Promotion
+    # ------------------------------------------------------------
     if not args.auto_approve:
-        if not prompt_user_confirmation("Staging DB updated. Proceed with PRODUCTION promotion?"):
-            logger.warning("Pipeline paused before Production deployment.")
+        if not prompt_user_confirmation("Stage 5 complete. Do you want to proceed with DISABLING Production Ingestion Jobs (Stage 6)?"):
+            logger.warning("Pipeline paused by user prior to disabling Production jobs.")
+            sys.exit(0)
+
+    if not run_stage("6_disable_ingestion_jobs.py"):
+        sys.exit(1)
+
+    # ------------------------------------------------------------
+    # STAGE 7: Production Environment Bulk Promotion
+    # ------------------------------------------------------------
+    if not args.auto_approve:
+        if not prompt_user_confirmation("Production jobs disabled. Do you want to proceed with PRODUCTION PROMOTION (Stage 7)?"):
+            logger.warning("Pipeline paused by user prior to Production promotion.")
             sys.exit(0)
 
     if not run_stage("7_run_bulk_promotion.py"):
         sys.exit(1)
 
-    # Stage 7: Trigger Manual Test Downloads (Production)
-    if not run_stage("7_trigger_manual_downloads_api.py"):
+    # ------------------------------------------------------------
+    # STAGE 8: Trigger Manual Downloads
+    # ------------------------------------------------------------
+    if not run_stage("8_trigger_manual_downloads.py"):
         sys.exit(1)
 
-    # Interactive Pause Gate
+    # Interactive Wait Gate
     logger.info("============================================================")
-    logger.info("⏳ PRODUCTION DOWNLOADS TRIGGERED IN STAGE 7")
+    logger.info("⏳ PRODUCTION DOWNLOADS TRIGGERED IN STAGE 8")
     logger.info(f"   Downloads typically take up to {args.wait_mins} minutes to process in BigQuery.")
     logger.info("============================================================")
 
@@ -142,26 +160,32 @@ def main() -> None:
             logger.info(f"⏳ Time remaining: {remaining // 60} minute(s)...")
             time.sleep(60)
 
-        logger.info("✅ Wait complete. Proceeding to Stage 8 log verification.")
+        logger.info("✅ Wait complete. Proceeding to Stage 9 log verification.")
     else:
-        if not prompt_user_confirmation(f"Have you allowed ~{args.wait_mins} minutes for downloads to complete? Ready to verify BigQuery logs (Stage 8)?"):
-            logger.warning("Pipeline paused by user prior to Stage 8 log verification.")
-            logger.info("💡 You can manually run 'python 8_verify_and_enable_jobs_api.py' when ready.")
+        if not prompt_user_confirmation(f"Have you allowed ~{args.wait_mins} minutes for downloads to complete? Ready to verify BigQuery logs (Stage 9)?"):
+            logger.warning("Pipeline paused by user prior to Stage 9 log verification.")
+            logger.info("💡 You can manually run 'python 9_verify_and_enable_injestion_jobs_api.py' when ready.")
             sys.exit(0)
 
-    # Stage 8: BigQuery Log Verification & Selective Job Enablement
-    if not run_stage("8_verify_and_enable_jobs_api.py"):
-        logger.error("⛔ Stage 8 detected errors in BigQuery logs or failed execution. Pipeline stopped.")
+    # ------------------------------------------------------------
+    # STAGE 9: Log Verification & Selective Job Enablement
+    # ------------------------------------------------------------
+    if not run_stage("9_verify_and_enable_injestion_jobs_api.py"):
+        logger.error("⛔ Stage 9 detected errors in BigQuery logs or failed execution. Pipeline stopped.")
         sys.exit(1)
 
-    # Stage 9: Safe Soft Delete via Microservice API
-    stage9_args = ["-y"] if args.auto_approve else []
-    if not run_stage("9_soft_delete_legacy_rules.py", stage9_args):
-        sys.exit(1)
-
-    # Stage 10: Consolidated Repository Sync, Archival & Ledger Update
+    # ------------------------------------------------------------
+    # STAGE 10: Safe Soft Delete via Microservice API
+    # ------------------------------------------------------------
     stage10_args = ["-y"] if args.auto_approve else []
-    if not run_stage("10_update_consolidated_repo.py", stage10_args):
+    if not run_stage("10_soft_delete_legacy_rules.py", stage10_args):
+        sys.exit(1)
+
+    # ------------------------------------------------------------
+    # STAGE 11: Consolidated Repo Sync, Archival & Ledger Update
+    # ------------------------------------------------------------
+    stage11_args = ["-y"] if args.auto_approve else []
+    if not run_stage("11_update_consolidated_repo.py", stage11_args):
         sys.exit(1)
 
     logger.info("============================================================")

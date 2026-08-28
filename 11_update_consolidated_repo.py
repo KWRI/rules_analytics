@@ -1,5 +1,5 @@
 """
-Stage 10: Update Consolidated Repo Script (With Safe Archival Check)
+Pipeline Stage 11: Update Consolidated Repo Script (With Safe Archival Check)
 
 Moves soft-deleted legacy rule files from active/ to archived/ in the git repository ONLY
 if they have been soft-deleted in the database. Updates processed_mls_ledger.json and
@@ -12,6 +12,7 @@ import json
 import io
 import shutil
 import argparse
+import csv
 import pandas as pd
 import psycopg2
 import paramiko
@@ -24,7 +25,7 @@ from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=current_dir / ".env")
-logger = setup_logger("Stage10_RepoArchive")
+logger = setup_logger("Stage11_RepoArchive")
 
 
 def load_old_rule_names(blueprint_path: Path) -> list[str]:
@@ -50,10 +51,10 @@ def get_deleted_rules_set(rule_names: list[str]) -> set[str]:
     Checks database over SSH tunnel to return rule names that have deleted_at IS NOT NULL.
     Uses LOWER() matching for case-insensitive accuracy.
     """
-    ssh_host = os.getenv("SSH_HOST", "").strip("'\"")
-    ssh_user = os.getenv("SSH_USER", "").strip("'\"")
-    ssh_key_path = os.getenv("SSH_KEY_PATH", "").strip("'\"")
-    ssh_passphrase = os.getenv("SSH_KEY_PASSPHRASE", "").strip("'\"")
+    ssh_host = (os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
+    ssh_user = (os.getenv("REMOTE_SSH_USER") or os.getenv("SSH_USER", "")).strip("'\"")
+    ssh_key_path = (os.getenv("REMOTE_SSH_KEY_PATH") or os.getenv("SSH_KEY_PATH", "")).strip("'\"")
+    ssh_passphrase = (os.getenv("REMOTE_SSH_KEY_PASSPHRASE") or os.getenv("SSH_KEY_PASSPHRASE", "")).strip("'\"")
 
     db_host = os.getenv("DB_HOST", "").strip("'\"")
     db_name = os.getenv("DB_NAME", "").strip("'\"")
@@ -100,7 +101,6 @@ def get_deleted_rules_set(rule_names: list[str]) -> set[str]:
                     """
                     cur.execute(query, (lowercased_targets,))
                     for (db_rule_name,) in cur.fetchall():
-                        # Map match back to blueprint rule names
                         for orig_name in rule_names:
                             if orig_name.lower() == db_rule_name.lower():
                                 deleted_rules.add(orig_name)
@@ -157,25 +157,34 @@ def archive_legacy_rules(blueprint_path: Path, repo_base_path: Path) -> bool:
 
 
 def update_processed_ledger(temp_dir: Path) -> None:
-    """Appends currently processed MLS IDs from api_mls.txt and rets_mls.txt to the processed ledger."""
-    candidate_files = [
-        temp_dir / "api_mls.txt",
-        temp_dir / "rets_mls.txt",
-    ]
+    """Appends currently processed MLS IDs from batch files to the processed ledger."""
     ledger_file = temp_dir / "processed_mls_ledger.json"
-
     current_mls = set()
-    for mls_file in candidate_files:
-        if mls_file.exists():
-            for line in mls_file.read_text(encoding="utf-8").splitlines():
-                cleaned = line.strip().strip("'\"")
-                if cleaned and not cleaned.startswith("#"):
-                    try:
-                        current_mls.add(int(cleaned))
-                    except ValueError:
-                        pass
+
+    # 1. Parse CSV batch target files
+    csv_candidates = [
+        temp_dir / "batch_mls_targets_rets.csv",
+        temp_dir / "batch_mls_targets_api.csv",
+    ]
+    for csv_file in csv_candidates:
+        if csv_file.exists():
+            with open(csv_file, mode="r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    mls_id = row.get("mls_id", "").strip()
+                    if mls_id.isdigit():
+                        current_mls.add(int(mls_id))
+
+    # 2. Parse promotion_sources.txt manifest
+    txt_manifest = temp_dir / "promotion_sources.txt"
+    if txt_manifest.exists():
+        for line in txt_manifest.read_text(encoding="utf-8").splitlines():
+            cleaned = line.strip().strip("'\"")
+            if cleaned.isdigit():
+                current_mls.add(int(cleaned))
 
     if not current_mls:
+        logger.info("ℹ️ No active MLS IDs detected in batch files to record in ledger.")
         return
 
     completed_mls = set()
@@ -211,7 +220,7 @@ def main() -> None:
     repo_path = Path(repo_base)
 
     logger.info("============================================================")
-    logger.info("📂 STAGE 10: CONSOLIDATED REPO ARCHIVE SYNC TOOL")
+    logger.info("📂 STAGE 11: CONSOLIDATED REPO ARCHIVE SYNC TOOL")
     logger.info("============================================================")
     logger.info(f"Target REPO_PATH: {repo_path}")
 

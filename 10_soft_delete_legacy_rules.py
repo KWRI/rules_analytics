@@ -1,9 +1,9 @@
 """
-Stage 9: Soft Delete Legacy Rules Script (With Active Reference Safety Guard)
+Pipeline Stage 10: Soft Delete Legacy Rules Script (Stage Environment)
 
 Parses 'temp-data/migration_blueprint.csv' and checks the staging database to ensure
 that targeted legacy rules are NOT currently in use by other unmigrated MLS sources.
-Only soft-deletes rules that have ZERO remaining active references via the MLS Admin API.
+Only soft-deletes rules that have ZERO remaining active references via the Stage MLS Admin API.
 
 API Specification:
     Method: DELETE
@@ -27,11 +27,16 @@ from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=current_dir / ".env")
-logger = setup_logger("Stage9_SoftDelete")
+logger = setup_logger("Stage10_SoftDeleteStage")
 
-API_BASE_URL = os.getenv("MLS_ADMIN_API_URL", "https://stage-ext-ms.data.kw.com").strip().strip("'\"").rstrip("/")
-API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
-DELETED_BY_USER = os.getenv("UPDATED_BY_USER") or os.getenv("DB_USER", "shrisha_vanga")
+# Explicit Stage Environment API Target
+API_BASE_URL = os.getenv(
+    "MLS_ADMIN_STAGE_URL",
+    "https://stage-ext-ms.data.kw.com/v1/mls-admin"
+).strip().strip("'\"").rstrip("/")
+
+API_KEY = os.getenv("MLS_ADMIN_STAGE_API_KEY") or os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
+DELETED_BY_USER = os.getenv("UPDATED_BY_USER") or os.getenv("DB_USER", "shrisha.vanga@kw.com")
 
 HEADERS = {
     "accept": "application/json",
@@ -61,13 +66,13 @@ def load_old_rule_names_from_blueprint(blueprint_path: Path) -> list[str]:
 
 def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
     """
-    Connects to DB over SSH tunnel to check if rules are still referenced by ANY active MLS mapping.
+    Connects to Staging DB over SSH tunnel to check if rules are still referenced by ANY active MLS mapping.
     Uses LOWER() matching to guard against rule name casing variations.
     """
-    ssh_host = os.getenv("SSH_HOST", "").strip("'\"")
-    ssh_user = os.getenv("SSH_USER", "").strip("'\"")
-    ssh_key_path = os.getenv("SSH_KEY_PATH", "").strip("'\"")
-    ssh_passphrase = os.getenv("SSH_KEY_PASSPHRASE", "").strip("'\"")
+    ssh_host = (os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
+    ssh_user = (os.getenv("REMOTE_SSH_USER") or os.getenv("SSH_USER", "")).strip("'\"")
+    ssh_key_path = (os.getenv("REMOTE_SSH_KEY_PATH") or os.getenv("SSH_KEY_PATH", "")).strip("'\"")
+    ssh_passphrase = (os.getenv("REMOTE_SSH_KEY_PASSPHRASE") or os.getenv("SSH_KEY_PASSPHRASE", "")).strip("'\"")
 
     db_host = os.getenv("DB_HOST", "").strip("'\"")
     db_name = os.getenv("DB_NAME", "").strip("'\"")
@@ -122,7 +127,6 @@ def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
                     """
                     cur.execute(query, (lowercased_targets,))
                     for rule_name, count in cur.fetchall():
-                        # Map count back to original rule name array
                         for orig_name in rule_names:
                             if orig_name.lower() == rule_name.lower():
                                 usage_counts[orig_name] += count
@@ -135,19 +139,19 @@ def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
 
 
 def delete_rule_via_api(rule_name: str, deleted_by: str) -> bool:
-    """Sends a DELETE request matching the exact Swagger API contract."""
-    url = f"{API_BASE_URL}/v1/mls-admin/rules"
+    """Sends a DELETE request matching the Stage Swagger API contract."""
+    endpoint = f"{API_BASE_URL}/rules" if API_BASE_URL.endswith("/mls-admin") else f"{API_BASE_URL}/v1/mls-admin/rules"
     params = {"name": rule_name, "deleted_by": deleted_by}
 
     try:
-        response = requests.delete(url, headers=HEADERS, params=params, timeout=15)
+        response = requests.delete(endpoint, headers=HEADERS, params=params, timeout=15)
         if response.status_code in (200, 204):
             try:
                 data = response.json()
                 rule_id = data.get("id", "N/A")
             except Exception:
                 rule_id = "N/A"
-            logger.info(f"   ✅ Soft-deleted rule: '{rule_name}' (ID: {rule_id}, by {deleted_by})")
+            logger.info(f"   ✅ Soft-deleted rule on Stage: '{rule_name}' (ID: {rule_id}, by {deleted_by})")
             return True
         else:
             logger.error(f"   ❌ Failed for '{rule_name}' [HTTP {response.status_code}]: {response.text}")
@@ -158,14 +162,15 @@ def delete_rule_via_api(rule_name: str, deleted_by: str) -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Soft delete legacy rules unlinked from active MLS sources.")
+    parser = argparse.ArgumentParser(description="Soft delete legacy rules unlinked from active Stage MLS sources.")
     parser.add_argument("-y", "--force", action="store_true", help="Auto-confirm soft deletion without user prompt.")
     args = parser.parse_args()
 
     blueprint_file = current_dir / "temp-data" / "migration_blueprint.csv"
     logger.info("============================================================")
-    logger.info("🗑️ STAGE 9: MLS ADMIN MICROSERVICE SAFE SOFT DELETE TOOL")
+    logger.info("🗑️ STAGE 10: STAGE MLS ADMIN MICROSERVICE SOFT DELETE TOOL")
     logger.info("============================================================")
+    logger.info(f"Target Stage API Base: {API_BASE_URL}")
 
     rule_names = load_old_rule_names_from_blueprint(blueprint_file)
     if not rule_names:
@@ -194,10 +199,10 @@ def main() -> None:
             logger.info(f"   • '{name}' (Used by {refs} active mapping(s) — SKIPPED)")
 
     if not rules_to_delete:
-        logger.info("🎉 No rules are ready for soft-deletion in this batch (all rules are still shared by unmigrated MLSs).")
+        logger.info("🎉 No rules are ready for soft-deletion in Stage (all rules are still shared by unmigrated MLSs).")
         return
 
-    logger.info(f"✅ Ready to soft-delete {len(rules_to_delete)} fully unlinked legacy rule(s):")
+    logger.info(f"✅ Ready to soft-delete {len(rules_to_delete)} fully unlinked legacy rule(s) from Stage:")
     for idx, name in enumerate(rules_to_delete, 1):
         logger.info(f"   {idx}. {name}")
 
@@ -206,19 +211,19 @@ def main() -> None:
             logger.warning("⚠️ Non-interactive session detected without --force flag. Aborting for safety.")
             return
 
-        confirm = input(f"\nConfirm soft-deletion of {len(rules_to_delete)} unlinked rule(s)? (y/N): ")
+        confirm = input(f"\nConfirm soft-deletion of {len(rules_to_delete)} unlinked Stage rule(s)? (y/N): ")
         if confirm.lower() != "y":
             logger.info("Operation cancelled by user.")
             return
 
-    logger.info("🚀 Starting API deletion sequence...")
+    logger.info("🚀 Starting Stage API deletion sequence...")
     success_count = 0
     for name in rules_to_delete:
         if delete_rule_via_api(name, DELETED_BY_USER):
             success_count += 1
 
     logger.info("============================================================")
-    logger.info(f"✅ STAGE 9 FINISHED: Soft-deleted {success_count}/{len(rules_to_delete)} rule(s) via API.")
+    logger.info(f"✅ STAGE 10 FINISHED: Soft-deleted {success_count}/{len(rules_to_delete)} rule(s) via Stage API.")
     logger.info("============================================================")
 
 
