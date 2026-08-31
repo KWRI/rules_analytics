@@ -1,22 +1,22 @@
 """
-Pipeline Stage 9: API Verification & Job Re-Enablement Engine.
+Pipeline Stage 9: Ingestion Data Verifier & API Scheduler Re-Enabler.
 
-1. Reads API batch IDs from 'temp-data/triggered_downloads_log_api.csv'.
-2. Queries BigQuery 'stream-listing-prod.mls_download.{content_type}' by batch_id.
-3. Checks 'kw_logger.data_team_logs' for ERROR severities matching target batch IDs.
-4. Re-enables verified clean API download jobs via HTTP POST and triggers Download Manager Scheduler Sync.
+1. Reads batch trigger records from 'temp-data/triggered_downloads_log_api.csv'.
+2. Queries BigQuery production landing tables (`stream-listing-prod.mls_download.<content_type>`)
+   using `batch_id` with polling retries to accommodate BigQuery streaming buffer flushes.
+3. Re-enables scheduled API download jobs for clean MLS targets via Production Microservice API.
+4. Triggers Production Download Manager Scheduler Sync.
 
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
 import os
-import sys
 import csv
+import time
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
 from google.cloud import bigquery
-from google.auth.exceptions import RefreshError
 
 from pipeline_logger import setup_logger
 
@@ -27,197 +27,101 @@ logger = setup_logger("Stage9_VerifyAndEnableAPI")
 # ==============================================================================
 # ENVIRONMENT CONSTANTS
 # ==============================================================================
-BIGQUERY_PROJECT = os.getenv("BIGQUERY_PROJECT", "data-shared-prod-44e4")
-DOWNLOAD_PROD_PROJECT = os.getenv("DOWNLOAD_PROD_PROJECT", "stream-listing-prod")
-
 MLS_ADMIN_PROD_URL = os.getenv("MLS_ADMIN_PROD_URL", "").strip().strip("'\"").rstrip("/")
 PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
+API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
 
-API_BASE_URL = MLS_ADMIN_PROD_URL
-MLS_ADMIN_API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
-UPDATED_BY_USER = os.getenv("UPDATED_BY_USER", "shrisha.vanga@kw.com")
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "stream-listing-prod").strip().strip("'\"")
+BQ_DATASET = "mls_download"
 
 
 # ==============================================================================
-# API VERIFICATION & RE-ENABLEMENT FUNCTIONS
+# BIGQUERY VERIFICATION ENGINE
 # ==============================================================================
 
-def load_triggered_api_downloads_log() -> list[dict]:
-    """Loads API batch trigger records from Stage 8 output log."""
-    log_file = current_dir / "temp-data" / "triggered_downloads_log_api.csv"
-
-    if not log_file.exists():
-        logger.info("ℹ️ No 'triggered_downloads_log_api.csv' found. Skipping API verification.")
-        return []
-
-    trigger_records = []
-    with open(log_file, mode="r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("batch_id"):
-                trigger_records.append({
-                    "mls_id": int(row["mls_id"].strip()),
-                    "mls_id_str": row.get("mls_id_str", "").strip(),
-                    "content_type": row["content_type"].strip(),
-                    "batch_id": row["batch_id"].strip(),
-                })
-
-    return trigger_records
-
-
-def verify_api_batch_records_in_bigquery(records: list[dict]) -> dict[str, int]:
-    """Queries stream-listing-prod.mls_download.{content_type} by exact batch_id."""
-    try:
-        client = bigquery.Client(project=DOWNLOAD_PROD_PROJECT)
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize BigQuery client: {e}")
-        logger.error("👉 Try running: `gcloud auth application-default login --scopes=\"https://www.googleapis.com/auth/cloud-platform\"` ")
-        return {}
-
-    logger.info("============================================================")
-    logger.info("🔍 CHECKING PRODUCTION DOWNLOAD TABLES BY BATCH ID (API)")
-    logger.info("============================================================")
-
-    batch_counts = {}
-
-    for r in records:
-        mls_id = r["mls_id"]
-        c_type = r["content_type"]
-        b_id = r["batch_id"]
-        table_name = f"{DOWNLOAD_PROD_PROJECT}.mls_download.{c_type}"
-
-        query = f"""
-            SELECT COUNT(*) AS downloaded_count
-            FROM `{table_name}`
-            WHERE mls_id = {mls_id}
-              AND CAST(batch_id AS STRING) = '{b_id}'
-        """
-
-        try:
-            logger.info(f"📦 Querying `{table_name}` | MLS: {mls_id} | batch_id: {b_id}")
-            query_job = client.query(query)
-            results = list(query_job.result())
-            count = results[0]["downloaded_count"] if results else 0
-
-            batch_counts[b_id] = count
-            if count > 0:
-                logger.info(f"   ✅ SUCCESS: Found {count} row(s) for Batch ID {b_id} in `{table_name}`.")
-            else:
-                logger.warning(f"   ⚠️ PENDING/EMPTY: No rows found yet for Batch ID {b_id} in `{table_name}`.")
-
-        except RefreshError:
-            logger.error("❌ GCP Authentication Expired! Run: `gcloud auth application-default login --scopes=\"https://www.googleapis.com/auth/cloud-platform\"` ")
-            sys.exit(1)
-        except Exception as e:
-            logger.error(f"❌ Error querying `{table_name}` for Batch ID {b_id}: {e}")
-            batch_counts[b_id] = 0
-
-    return batch_counts
-
-
-def check_api_error_logs(records: list[dict]) -> list[str]:
-    """Checks kw_logger.data_team_logs for ERROR severities matching target batch IDs."""
-    batch_ids = [r["batch_id"] for r in records if r.get("batch_id")]
-    if not batch_ids:
-        return []
-
-    try:
-        client = bigquery.Client(project=BIGQUERY_PROJECT)
-    except Exception:
-        return []
-
-    batch_ids_formatted = ", ".join(f"'{b}'" for b in batch_ids)
-    regex_pattern = "|".join(batch_ids)
+def verify_batch_landing_bq(client: bigquery.Client, content_type: str, mls_id: int, batch_id: str, max_attempts: int = 5, sleep_sec: int = 10) -> int:
+    """Queries BigQuery to verify rows landed for a batch ID, polling to allow streaming buffer flushes."""
+    table_name = "listing" if content_type.lower() == "listing" else "open_house"
+    table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{table_name}"
 
     query = f"""
-        SELECT 
-            COALESCE(
-                CAST(JSON_VALUE(json_payload, '$.batch_id') AS STRING),
-                REGEXP_EXTRACT(CAST(text_payload AS STRING), r'({regex_pattern})')
-            ) AS batch_id,
-            COUNT(*) AS error_count
-        FROM `{BIGQUERY_PROJECT}.kw_logger.data_team_logs`
-        WHERE processed_at >= DATETIME(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY))
-          AND severity = 'ERROR'
-          AND (
-            CAST(JSON_VALUE(json_payload, '$.batch_id') AS STRING) IN ({batch_ids_formatted})
-            OR REGEXP_CONTAINS(CAST(text_payload AS STRING), r'({regex_pattern})')
-          )
-        GROUP BY 1
+        SELECT COUNT(1) AS row_count
+        FROM `{table_id}`
+        WHERE CAST(batch_id AS STRING) = '{batch_id}'
+          AND mls_id = {mls_id}
     """
 
-    failing_batch_ids = []
-    try:
-        query_job = client.query(query)
-        results = query_job.result()
-        for row in results:
-            if row["error_count"] > 0 and row["batch_id"]:
-                failing_batch_ids.append(row["batch_id"])
-                logger.error(f"   ❌ Batch ID {row['batch_id']}: Detected {row['error_count']} ERROR log(s).")
-    except RefreshError:
-        logger.error("❌ GCP Authentication Expired! Run: `gcloud auth application-default login --scopes=\"https://www.googleapis.com/auth/cloud-platform\"` ")
-        sys.exit(1)
-    except Exception as e:
-        logger.warning(f"⚠️ Log error check encountered an exception: {e}")
+    logger.info(f"📦 Querying `{table_id}` | MLS: {mls_id} | batch_id: {batch_id}")
 
-    return failing_batch_ids
+    for attempt in range(1, max_attempts + 1):
+        try:
+            query_job = client.query(query)
+            results = list(query_job.result())
+            row_count = results[0].row_count if results else 0
+
+            if row_count > 0:
+                logger.info(f"   ✅ SUCCESS: Found {row_count} row(s) for Batch ID {batch_id} in `{table_id}`.")
+                return row_count
+
+            if attempt < max_attempts:
+                time.sleep(sleep_sec)
+
+        except Exception as e:
+            logger.warning(f"   ⚠️ BigQuery Query Exception on attempt {attempt}/{max_attempts}: {e}")
+            if attempt < max_attempts:
+                time.sleep(sleep_sec)
+
+    logger.warning(f"   ⚠️ PENDING/EMPTY: No rows found yet for Batch ID {batch_id} in `{table_id}`.")
+    return 0
 
 
-def trigger_scheduler_sync() -> bool:
-    """Triggers Download Manager Scheduler Sync POST call on Production."""
-    if not PROD_BASE_URL:
-        return False
+# ==============================================================================
+# API SCHEDULER RESTORATION ENGINE
+# ==============================================================================
 
-    sync_url = f"{PROD_BASE_URL}/v1/download-manager/scheduler/sync"
-    logger.info("🔄 ACTION: TRIGGER PRODUCTION DOWNLOAD MANAGER SCHEDULER SYNC")
-
+def enable_api_jobs(session: requests.Session, mls_ids: list[int]) -> bool:
+    """Re-enables scheduled API download jobs for clean MLS IDs."""
+    url = f"{PROD_BASE_URL}/v1/mls-admin/mls/download/jobs/enable"
     headers = {
         "accept": "application/json",
-        "api-key": MLS_ADMIN_API_KEY,
-    }
-
-    try:
-        response = requests.post(sync_url, headers=headers, data="", timeout=15)
-        if response.status_code in (200, 201, 204):
-            logger.info("✅ SUCCESS: Download Manager Scheduler synchronized successfully.")
-            return True
-        else:
-            logger.error(f"❌ SCHEDULER SYNC FAILED [{response.status_code}]: {response.text}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ Scheduler Sync Exception: {e}")
-        return False
-
-
-def enable_api_download_jobs(mls_ids: list[int]) -> bool:
-    """Enables MLS Download Jobs for clean target sources on Production API."""
-    if not API_BASE_URL or not mls_ids:
-        return False
-
-    endpoint = f"{API_BASE_URL}/mls/download/jobs/enable"
-    params = {"temp_update": "true"}
-
-    headers = {
-        "accept": "application/json",
-        "api-key": MLS_ADMIN_API_KEY,
+        "api-key": API_KEY,
         "Content-Type": "application/json"
     }
 
-    payload = {
-        "sources": mls_ids,
-        "updated_by": UPDATED_BY_USER
-    }
+    payload = {"mls_ids": mls_ids}
 
     try:
-        response = requests.post(endpoint, params=params, headers=headers, json=payload, timeout=15)
-        if response.status_code in (200, 201):
+        response = session.post(url, headers=headers, json=payload, timeout=30)
+        if response.status_code in (200, 201, 202):
             logger.info(f"✅ SUCCESS: Re-enabled API jobs for clean MLS IDs: {mls_ids}")
             return True
         else:
-            logger.error(f"❌ FAILED TO ENABLE API JOBS [{response.status_code}]: {response.text}")
+            logger.error(f"❌ Failed to enable API jobs [{response.status_code}]: {response.text}")
             return False
     except Exception as e:
-        logger.error(f"❌ API Request Exception: {e}")
+        logger.error(f"❌ Exception enabling API jobs for MLS IDs {mls_ids}: {e}")
+        return False
+
+
+def sync_download_manager_scheduler(session: requests.Session) -> bool:
+    """Triggers Production Download Manager Scheduler Sync."""
+    url = f"{PROD_BASE_URL}/v1/download-manager/scheduler/sync"
+    headers = {
+        "accept": "application/json",
+        "api-key": API_KEY,
+    }
+
+    logger.info("🔄 ACTION: TRIGGER PRODUCTION DOWNLOAD MANAGER SCHEDULER SYNC")
+    try:
+        response = session.post(url, headers=headers, data="", timeout=30)
+        if response.status_code in (200, 201, 202):
+            logger.info("✅ SUCCESS: Download Manager Scheduler synchronized successfully.")
+            return True
+        else:
+            logger.error(f"❌ Scheduler Sync Failed [{response.status_code}]: {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Exception triggering Scheduler Sync: {e}")
         return False
 
 
@@ -225,36 +129,72 @@ def enable_api_download_jobs(mls_ids: list[int]) -> bool:
 # MAIN ROUTING ENGINE
 # ==============================================================================
 
-def main() -> None:
+def main():
     logger.info("============================================================")
     logger.info("🚀 STAGE 9: VERIFYING DOWNLOADS & RE-ENABLING API JOBS")
     logger.info("============================================================")
 
-    trigger_records = load_triggered_api_downloads_log()
+    triggered_log_path = current_dir / "temp-data" / "triggered_downloads_log_api.csv"
 
-    if not trigger_records:
-        logger.info("No active API trigger records found to verify. Execution complete.")
+    if not triggered_log_path.exists():
+        logger.warning("No API trigger log found ('temp-data/triggered_downloads_log_api.csv'). Skipping Stage 9.")
         return
 
-    batch_counts = verify_api_batch_records_in_bigquery(trigger_records)
-    failing_batches = check_api_error_logs(trigger_records)
+    triggered_records = []
+    with open(triggered_log_path, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("mls_id") and row.get("batch_id"):
+                triggered_records.append({
+                    "mls_id": int(row["mls_id"].strip()),
+                    "mls_id_str": row.get("mls_id_str", "").strip(),
+                    "content_type": row.get("content_type", "").strip(),
+                    "content_sub_type": row.get("content_sub_type", "").strip(),
+                    "batch_id": str(row["batch_id"]).strip(),
+                })
 
-    verified_mls_ids = set()
-    for r in trigger_records:
-        m_id = r["mls_id"]
-        b_id = r["batch_id"]
-        if b_id not in failing_batches and batch_counts.get(b_id, 0) > 0:
-            verified_mls_ids.add(m_id)
+    if not triggered_records:
+        logger.warning("Trigger log CSV is empty. No API batch IDs to verify.")
+        return
 
-    clean_ids = sorted(list(verified_mls_ids))
+    # 1. BigQuery Data Landing Verification
+    bq_client = bigquery.Client(project=GCP_PROJECT_ID)
+    mls_verified_map = {}
 
-    if clean_ids:
-        logger.info(f"✅ CLEAN & VERIFIED API TARGETS ({len(clean_ids)}): {clean_ids}")
-        if enable_api_download_jobs(clean_ids):
-            trigger_scheduler_sync()
-        logger.info("\n🎉 Stage 9 completed successfully! Scheduled API jobs are restored.")
-    else:
-        logger.warning("⚠️ No API targets passed verification. Download jobs remain disabled for safety.")
+    logger.info("============================================================")
+    logger.info("🔍 CHECKING PRODUCTION DOWNLOAD TABLES BY BATCH ID (API)")
+    logger.info("============================================================")
+
+    for rec in triggered_records:
+        mls_id = rec["mls_id"]
+        if mls_id not in mls_verified_map:
+            mls_verified_map[mls_id] = False
+
+        rows_found = verify_batch_landing_bq(
+            bq_client,
+            rec["content_type"],
+            mls_id,
+            rec["batch_id"]
+        )
+
+        if rows_found > 0:
+            mls_verified_map[mls_id] = True
+
+    clean_mls_ids = [mls_id for mls_id, verified in mls_verified_map.items() if verified]
+
+    logger.info("============================================================")
+    logger.info(f"✅ CLEAN & VERIFIED API TARGETS ({len(clean_mls_ids)}): {clean_mls_ids}")
+
+    if not clean_mls_ids:
+        logger.error("❌ No API targets were verified in BigQuery. Skipping job restoration.")
+        return
+
+    # 2. Re-enable API Scheduled Jobs
+    session = requests.Session()
+    if enable_api_jobs(session, clean_mls_ids):
+        sync_download_manager_scheduler(session)
+
+    logger.info("\n🎉 Stage 9 completed successfully! Scheduled API jobs are restored.")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,8 @@ and triggers ingestion downloads in parallel:
   - RETS Integration: Enables Jenkins jobs, triggers 'buildWithParameters' (LOAD_TYPE=incr),
                       and polls execution status until completion concurrently.
   - API Integration: Triggers 3-day manual reprocess downloads via Production Microservice API,
-                     captures batch IDs, and logs details to 'temp-data/triggered_downloads_log_api.csv'.
+                     captures batch IDs as strict strings, and logs details to
+                     'temp-data/triggered_downloads_log_api.csv'.
 
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
@@ -212,7 +213,6 @@ def process_rets_triggers_parallel(rets_targets: set):
     if not matched_jobs:
         return
 
-    # Multithreaded execution across worker threads
     success_count = 0
     failure_count = 0
 
@@ -240,8 +240,8 @@ def process_rets_triggers_parallel(rets_targets: set):
 # CODE BLOCK 2: API INGESTION MANUAL DOWNLOAD TRIGGER ENGINE
 # ==============================================================================
 
-def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str, content_type: str, content_sub_type: str) -> dict | None:
-    """Triggers 3-day download for an API target and returns the record if successful."""
+def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str, content_type: str, content_sub_type: str, max_retries: int = 4) -> dict | None:
+    """Triggers 3-day download for an API target with strict string batch ID casting and backoff retry logic."""
     url = f"{PROD_BASE_URL}/v1/listing-mflow/reprocess/download/mls/{mls_id}"
 
     headers = {
@@ -265,43 +265,63 @@ def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str
         f"🚀 Triggering 3-Day Download | MLS: {mls_id} ({mls_id_str}) | [{content_type} / {content_sub_type}]"
     )
 
-    try:
-        response = session.post(url, headers=headers, params=params, data="", timeout=30)
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = session.post(url, headers=headers, params=params, data="", timeout=30)
 
-        if response.status_code in (200, 201, 202):
-            data = response.json() if response.text else {}
-            batch_id = str(data.get("batch_id", "")).strip()
-            logger.info(f"   ✅ SUCCESS [{response.status_code}]: Triggered Batch ID = {batch_id}")
-            if batch_id:
-                return {
-                    "mls_id": mls_id,
-                    "mls_id_str": mls_id_str,
-                    "content_type": content_type,
-                    "content_sub_type": content_sub_type,
-                    "batch_id": batch_id,
-                }
+            if response.status_code in (200, 201, 202):
+                data = response.json() if response.text else {}
+
+                # FORCE STRICT STRING CASTING TO PREVENT 64-BIT INT FLOAT ROUNDING
+                raw_batch_id = data.get("batch_id")
+                batch_id = str(raw_batch_id).strip() if raw_batch_id is not None else ""
+
+                logger.info(f"   ✅ SUCCESS [{response.status_code}]: Triggered Batch ID = {batch_id}")
+                if batch_id:
+                    return {
+                        "mls_id": mls_id,
+                        "mls_id_str": mls_id_str,
+                        "content_type": content_type,
+                        "content_sub_type": content_sub_type,
+                        "batch_id": batch_id,
+                    }
+                return None
+
+            elif response.status_code == 403:
+                err = response.json().get("message", response.text) if response.text else "Forbidden"
+                logger.error(f"   ❌ AUTH ERROR [403]: Invalid API key. ({err})")
+                return None
+
+            elif response.status_code in (406, 422):
+                err = response.json().get("message", response.text) if response.text else "Validation error"
+                logger.error(
+                    f"   ❌ INPUT ERROR [{response.status_code}]: Invalid request for MLS {mls_id} "
+                    f"({content_type}/{content_sub_type}). Message: {err}"
+                )
+                return None
+
+            # Handle intermittent microservice KeyError locks with backoff (2s, 4s, 6s)
+            elif response.status_code == 404 and "KeyError" in response.text and attempt < max_retries:
+                backoff = attempt * 2
+                logger.warning(
+                    f"   ⚠️ Intermittent Backend KeyError [404] for MLS {mls_id} ({content_type}). "
+                    f"Retrying attempt {attempt}/{max_retries} in {backoff}s..."
+                )
+                time.sleep(backoff)
+                continue
+
+            else:
+                logger.error(f"   ❌ UNEXPECTED ERROR [{response.status_code}]: {response.text}")
+                return None
+
+        except requests.RequestException as e:
+            if attempt < max_retries:
+                time.sleep(2)
+                continue
+            logger.error(f"   ❌ Request Exception for MLS {mls_id}: {e}", exc_info=True)
             return None
 
-        elif response.status_code == 403:
-            err = response.json().get("message", response.text) if response.text else "Forbidden"
-            logger.error(f"   ❌ AUTH ERROR [403]: Invalid API key. ({err})")
-            return None
-
-        elif response.status_code in (406, 422):
-            err = response.json().get("message", response.text) if response.text else "Validation error"
-            logger.error(
-                f"   ❌ INPUT ERROR [{response.status_code}]: Invalid request for MLS {mls_id} "
-                f"({content_type}/{content_sub_type}). Message: {err}"
-            )
-            return None
-
-        else:
-            logger.error(f"   ❌ UNEXPECTED ERROR [{response.status_code}]: {response.text}")
-            return None
-
-    except requests.RequestException as e:
-        logger.error(f"   ❌ Request Exception for MLS {mls_id}: {e}", exc_info=True)
-        return None
+    return None
 
 
 def save_triggered_downloads_log(batch_records: list[dict]) -> Path:
@@ -321,9 +341,9 @@ def save_triggered_downloads_log(batch_records: list[dict]) -> Path:
 
 
 def process_api_triggers_parallel(api_targets: list[dict]):
-    """Processes 3-day manual reprocess downloads for API protocol targets concurrently."""
+    """Processes 3-day manual reprocess downloads serially per MLS ID to eliminate backend thread locks."""
     logger.info("------------------------------------------------------------")
-    logger.info(f"⚙️ [API BLOCK] Processing {len(api_targets)} target download payload(s) via API Service (Parallel)...")
+    logger.info(f"⚙️ [API BLOCK] Processing {len(api_targets)} target download payload(s) via API Service...")
     logger.info("------------------------------------------------------------")
 
     if not API_KEY:
@@ -335,25 +355,46 @@ def process_api_triggers_parallel(api_targets: list[dict]):
     total_triggered = 0
     total_failed = 0
 
-    with ThreadPoolExecutor(max_workers=min(len(api_targets), MAX_PARALLEL_WORKERS)) as executor:
-        future_to_payload = {
-            executor.submit(
-                trigger_api_download,
+    # Group targets by MLS ID so payloads for the same source run sequentially
+    grouped_by_mls = {}
+    for t in api_targets:
+        grouped_by_mls.setdefault(t["mls_id"], []).append(t)
+
+    def process_mls_group(targets_list):
+        group_records = []
+        for idx, t in enumerate(targets_list):
+            if idx > 0:
+                time.sleep(1.5)  # 1.5s pause between listing & open_house for the same source
+            res = trigger_api_download(
                 session,
                 t["mls_id"],
                 t["mls_id_str"],
                 t["content_type"],
                 t["content_sub_type"]
-            ): t for t in api_targets
+            )
+            if res:
+                group_records.append(res)
+        return group_records
+
+    # Execute different MLS sources concurrently, but payloads per MLS serially
+    with ThreadPoolExecutor(max_workers=min(len(grouped_by_mls), MAX_PARALLEL_WORKERS)) as executor:
+        future_to_mls = {
+            executor.submit(process_mls_group, targets): mls_id
+            for mls_id, targets in grouped_by_mls.items()
         }
 
-        for future in as_completed(future_to_payload):
-            rec = future.result()
-            if rec:
-                total_triggered += 1
-                triggered_records.append(rec)
-            else:
-                total_failed += 1
+        for future in as_completed(future_to_mls):
+            mls_id = future_to_mls[future]
+            try:
+                recs = future.result()
+                if recs:
+                    triggered_records.extend(recs)
+                    total_triggered += len(recs)
+                expected_count = len(grouped_by_mls[mls_id])
+                total_failed += (expected_count - len(recs))
+            except Exception as exc:
+                logger.error(f"❌ Exception in group execution for MLS '{mls_id}': {exc}")
+                total_failed += len(grouped_by_mls[mls_id])
 
     save_triggered_downloads_log(triggered_records)
     logger.info(f"✅ API Triggers Complete | Successful: {total_triggered} | Failed: {total_failed}")
