@@ -114,6 +114,8 @@ def run_production_extractor():
 
     # 1. Load active mutations directly from Stage 2 blueprint
     blueprint_mapping = {}
+    skipped_identical_count = 0
+
     with open(blueprint_path, mode="r", encoding="utf-8") as f:
         reader = csv.reader(f)
         next(reader, None)  # Skip Header Row
@@ -124,10 +126,20 @@ def run_production_extractor():
                 filename = proposed_new_name if proposed_new_name.endswith(".py") else f"{proposed_new_name}.py"
                 if (active_rules_dir / filename).exists():
                     clean_new_name = proposed_new_name[:-3] if proposed_new_name.endswith(".py") else proposed_new_name
+
+                    # SKIP EXTRACTION IF OLD NAME MATCHES PROPOSED NEW NAME
+                    if old_name == clean_new_name:
+                        logger.info(f"ℹ️ Skipping rule '{old_name}' from CSV extraction because old name matches proposed new name.")
+                        skipped_identical_count += 1
+                        continue
+
                     blueprint_mapping[old_name] = clean_new_name
 
     if not blueprint_mapping:
-        logger.info("No active rule mutations mapped in the blueprint to extract.")
+        if skipped_identical_count > 0:
+            logger.info(f"Skipped all {skipped_identical_count} candidate rule(s) because old and proposed new names are identical. No CSV generated.")
+        else:
+            logger.info("No active rule mutations mapped in the blueprint to extract.")
         return
 
     target_rules_set = set(blueprint_mapping.keys())
