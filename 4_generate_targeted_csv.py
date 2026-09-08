@@ -16,6 +16,7 @@ import os
 import io
 import json
 import csv
+import time
 import warnings
 from pathlib import Path
 import psycopg2
@@ -25,15 +26,36 @@ from sshtunnel import SSHTunnelForwarder
 from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
 
-from rules_utils import load_target_mls
+from rules_utils import load_target_mls, load_processed_ledger
 from pipeline_logger import setup_logger
 
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
-# Load environment variables from local .env
-load_dotenv()
+current_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage4_ExtractCSV")
+
+
+def update_ledger_directly(temp_data_dir: Path, no_op_mls_ids: set[int]) -> None:
+    """Writes no-op (already standardized) MLS IDs directly into processed_mls_ledger.json."""
+    if not no_op_mls_ids:
+        return
+
+    ledger_file = temp_data_dir / "processed_mls_ledger.json"
+    completed_mls = load_processed_ledger(temp_data_dir)
+
+    completed_mls.update(no_op_mls_ids)
+    ledger_file.parent.mkdir(parents=True, exist_ok=True)
+    ledger_file.write_text(
+        json.dumps({"completed_mls_ids": sorted(list(completed_mls))}, indent=2),
+        encoding="utf-8"
+    )
+
+    logger.info(
+        f"✅ [DIRECT LEDGER UPDATE] Recorded {len(no_op_mls_ids)} no-op MLS ID(s) "
+        f"({', '.join(str(m) for m in sorted(list(no_op_mls_ids)))}) directly into '{ledger_file.name}'."
+    )
 
 
 def extract_rules_recursive(schema_node, target_rules_set, current_path=""):
@@ -82,62 +104,57 @@ def extract_rules_recursive(schema_node, target_rules_set, current_path=""):
 
 
 def run_production_extractor():
-    repo_path_raw = os.getenv("REPO_PATH", "")
-    repo_path = repo_path_raw.strip().strip("'\"")
+    repo_base_raw = os.getenv("REPO_PATH", "") or os.getenv("UI_RULES_DIR", "")
+    repo_path = repo_base_raw.strip().strip("'\"")
     if not repo_path:
-        logger.error("REPO_PATH missing from your environment configuration.")
-        return
+        repo_path = str(current_dir.parent / "dm-consolidated-rules")
 
-    # Base directory paths within the consolidated repo layout
-    standard_names_root = Path(repo_path) / "standard-rule-names"
-    active_rules_dir = standard_names_root / "active"
+    ui_rules_root = Path(repo_path) / "ui-rules"
+    if not ui_rules_root.exists() and (Path(repo_path) / "active").exists():
+        active_rules_dir = Path(repo_path) / "active"
+    else:
+        active_rules_dir = ui_rules_root / "active"
 
-    # Maps temp-data strictly relative to this engine script
-    script_execution_dir = Path(__file__).resolve().parent
-    temp_data_dir = script_execution_dir / "temp-data"
+    temp_data_dir = current_dir / "temp-data"
     temp_data_dir.mkdir(parents=True, exist_ok=True)
 
     blueprint_path = temp_data_dir / "migration_blueprint.csv"
     output_csv_path = temp_data_dir / "raw_targeted_rules.csv"
     txt_output_path = temp_data_dir / "promotion_sources.txt"
 
-    if not blueprint_path.exists() or not active_rules_dir.exists():
+    if not blueprint_path.exists():
         logger.error("Stage 2 assets missing. Please execute Stage 2 standardization first.")
         return
 
-    # Check for target MLS batch files via rules_utils.py
     target_batch_mls = load_target_mls(temp_data_dir)
     if target_batch_mls:
         logger.info(f"🎯 [MLS BATCH TARGET] Targeting {len(target_batch_mls)} specified MLS ID(s): {sorted(list(target_batch_mls))}")
     else:
         logger.info("🚀 [FULL MODE] Executing extraction across ALL active MLS configurations...")
 
-    # 1. Load active mutations directly from Stage 2 blueprint
     blueprint_mapping = {}
     skipped_identical_count = 0
 
     with open(blueprint_path, mode="r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        next(reader, None)  # Skip Header Row
+        next(reader, None)
         for row in reader:
             if len(row) >= 2:
                 old_name, proposed_new_name = row[0].strip(), row[1].strip()
+                clean_new_name = proposed_new_name[:-3] if proposed_new_name.endswith(".py") else proposed_new_name
 
-                filename = proposed_new_name if proposed_new_name.endswith(".py") else f"{proposed_new_name}.py"
-                if (active_rules_dir / filename).exists():
-                    clean_new_name = proposed_new_name[:-3] if proposed_new_name.endswith(".py") else proposed_new_name
+                if old_name == clean_new_name:
+                    logger.info(f"ℹ️ Skipping rule '{old_name}' from CSV extraction because old name matches proposed new name.")
+                    skipped_identical_count += 1
+                    continue
 
-                    # SKIP EXTRACTION IF OLD NAME MATCHES PROPOSED NEW NAME
-                    if old_name == clean_new_name:
-                        logger.info(f"ℹ️ Skipping rule '{old_name}' from CSV extraction because old name matches proposed new name.")
-                        skipped_identical_count += 1
-                        continue
-
-                    blueprint_mapping[old_name] = clean_new_name
+                blueprint_mapping[old_name] = clean_new_name
 
     if not blueprint_mapping:
         if skipped_identical_count > 0:
             logger.info(f"Skipped all {skipped_identical_count} candidate rule(s) because old and proposed new names are identical. No CSV generated.")
+            if target_batch_mls:
+                update_ledger_directly(temp_data_dir, target_batch_mls)
         else:
             logger.info("No active rule mutations mapped in the blueprint to extract.")
         return
@@ -155,18 +172,20 @@ def run_production_extractor():
     with open(output_csv_path, mode="w", newline="", encoding="utf-8") as f:
         csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow(headers)
 
-    ssh_host = os.getenv("SSH_HOST", "").strip().strip("'\"")
-    ssh_user = os.getenv("SSH_USER", "").strip().strip("'\"")
-    ssh_key_path = os.getenv("SSH_KEY_PATH", "").strip().strip("'\"")
-    ssh_passphrase = os.getenv("SSH_KEY_PASSPHRASE", "").strip().strip("'\"")
+    ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
+    ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
+    ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
+    ssh_passphrase = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
 
-    db_host = os.getenv("DB_HOST", "").strip().strip("'\"")
-    db_name = os.getenv("DB_NAME", "").strip().strip("'\"")
-    db_user = os.getenv("DB_USER", "").strip().strip("'\"")
-    db_pass = os.getenv("DB_PASSWORD", "").strip().strip("'\"")
+    db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
+    db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
+    db_user = (os.getenv("DB_USER", "")).strip("'\"")
+    db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
+
+    captured_mls_ids = set()
+    total_match_count = 0
 
     try:
-        # Load OpenSSH key using cryptography serialization
         with open(ssh_key_path, "rb") as key_file:
             private_key = serialization.load_pem_private_key(
                 key_file.read(),
@@ -181,19 +200,20 @@ def run_production_extractor():
 
         logger.info(f"Establishing SSH tunnel to connect to database '{db_name}'...")
         with SSHTunnelForwarder(
-                (ssh_host, 22),
-                ssh_username=ssh_user,
-                ssh_pkey=mypkey,
-                remote_bind_address=(db_host, 5432),
+            (ssh_host, 22),
+            ssh_username=ssh_user,
+            ssh_pkey=mypkey,
+            remote_bind_address=(db_host, 5432),
         ) as tunnel:
             with psycopg2.connect(
-                    dbname=db_name,
-                    user=db_user,
-                    password=db_pass,
-                    host="127.0.0.1",
-                    port=tunnel.local_bind_port,
+                dbname=db_name,
+                user=db_user,
+                password=db_pass,
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
             ) as conn:
-                with conn.cursor(name="master_bulk_sweep_stream_cursor") as streaming_cur:
+                cursor_name = f"master_bulk_sweep_stream_cursor_{int(time.time())}"
+                with conn.cursor(name=cursor_name) as streaming_cur:
                     streaming_cur.itersize = 200
 
                     query = """
@@ -213,7 +233,7 @@ def run_production_extractor():
                         JOIN map_rule_association mra ON mr.process_map_id = mra.process_map_id
                         JOIN process_rule pr    ON mra.process_rule_id = pr.id
                         LEFT JOIN process_map pm ON pm.id = mra.process_map_id
-                        JOIN vendor v           ON v.id = m.vendor_id
+                        JOIN vendor v            ON v.id = m.vendor_id
                         JOIN content_type_map ctm ON ctm.id = mr.content_type_map_id
                         JOIN download_mls dm    ON dm.mls_id = m.id
                         JOIN download_config dc  ON dc.id = dm.download_config_id
@@ -223,9 +243,6 @@ def run_production_extractor():
                           AND pr.name = ANY(%s);
                     """
                     streaming_cur.execute(query, (list(target_rules_set),))
-
-                    total_match_count = 0
-                    captured_mls_ids = set()
 
                     with open(output_csv_path, mode="a", newline="", encoding="utf-8") as csv_file:
                         writer = csv.writer(csv_file, quoting=csv.QUOTE_MINIMAL)
@@ -238,7 +255,6 @@ def run_production_extractor():
                                 is_enabled, raw_properties, raw_mapping_fields
                             ) = row
 
-                            # Filter out records if api_mls.txt or rets_mls.txt is actively targeting specific MLS IDs
                             if target_batch_mls and mls_id is not None:
                                 try:
                                     if int(mls_id) not in target_batch_mls:
@@ -275,7 +291,7 @@ def run_production_extractor():
                                 struct_path = match["structural_path"]
                                 node = match["field_value"]
 
-                                if struct_path not in api_compliant_paths:
+                                if api_compliant_paths and struct_path not in api_compliant_paths:
                                     continue
 
                                 rule_obj = node.get("rule", {})
@@ -329,11 +345,17 @@ def run_production_extractor():
                                     except ValueError:
                                         pass
 
-                    # Write unique MLS ID manifest in ascending order
-                    if captured_mls_ids:
+                    export_ids = captured_mls_ids or target_batch_mls
+                    if export_ids:
                         with open(txt_output_path, mode="w", encoding="utf-8") as txt_f:
-                            for unique_id in sorted(list(captured_mls_ids)):
+                            for unique_id in sorted(list(export_ids)):
                                 txt_f.write(f"{unique_id}\n")
+
+                if target_batch_mls:
+                    no_op_mls_ids = target_batch_mls.difference(captured_mls_ids)
+                    if no_op_mls_ids:
+                        logger.info(f"ℹ️ Found {len(no_op_mls_ids)} MLS source(s) requiring 0 rule mutations: {sorted(list(no_op_mls_ids))}")
+                        update_ledger_directly(temp_data_dir, no_op_mls_ids)
 
                 logger.info("============================================================")
                 logger.info("🚀 STAGE 4 COMPLETE: ARCHITECTURAL EXTRACTION ENGINE SUCCESSFUL")

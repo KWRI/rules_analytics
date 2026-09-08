@@ -33,7 +33,8 @@ from pipeline_logger import setup_logger
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
-load_dotenv()
+current_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage2_StandardizeRules")
 
 
@@ -94,7 +95,7 @@ def to_pascal_case(name: str) -> str:
             match = re.search(r"[a-zA-Z]", word)
             if match:
                 idx = match.start()
-                word = word[:idx] + word[idx].upper() + word[idx+1:]
+                word = word[:idx] + word[idx].upper() + word[idx + 1:]
             pascal_words.append(word)
 
     pascal = "".join(pascal_words)
@@ -127,14 +128,12 @@ def write_standard_file(target_path: Path, content: str | None) -> None:
 
 
 def run_standardization():
-    repo_path_raw = os.getenv("REPO_PATH", "")
-    repo_path = repo_path_raw.strip().strip("'\"")
+    repo_base_raw = os.getenv("REPO_PATH", "") or os.getenv("UI_RULES_DIR", "")
+    repo_path = repo_base_raw.strip().strip("'\"")
     if not repo_path:
-        logger.error("REPO_PATH missing from environment configuration.")
-        return
+        repo_path = str(current_dir.parent / "dm-consolidated-rules")
 
-    project_dir = Path(__file__).resolve().parent
-    temp_data_dir = project_dir / "temp-data"
+    temp_data_dir = current_dir / "temp-data"
     temp_data_dir.mkdir(parents=True, exist_ok=True)
 
     # Union of rules from api_rules.txt and rets_rules.txt
@@ -168,15 +167,16 @@ def run_standardization():
     csv_output_path = temp_data_dir / "migration_blueprint.csv"
     ensure_git_ignores_csv_artifacts(target_base_dir)
 
-    ssh_host = os.getenv("SSH_HOST", "").strip().strip("'\"")
-    ssh_user = os.getenv("SSH_USER", "").strip().strip("'\"")
-    ssh_key_path = os.getenv("SSH_KEY_PATH", "").strip().strip("'\"")
-    ssh_passphrase = os.getenv("SSH_KEY_PASSPHRASE", "").strip().strip("'\"")
+    # Staging SSH & DB Configuration with Fallbacks
+    ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
+    ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
+    ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
+    ssh_passphrase = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
 
-    db_host = os.getenv("DB_HOST", "").strip().strip("'\"")
-    db_name = os.getenv("DB_NAME", "").strip().strip("'\"")
-    db_user = os.getenv("DB_USER", "").strip().strip("'\"")
-    db_pass = os.getenv("DB_PASSWORD", "").strip().strip("'\"")
+    db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
+    db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
+    db_user = (os.getenv("DB_USER", "")).strip("'\"")
+    db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
 
     db_raw_records = {}
 

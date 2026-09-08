@@ -5,10 +5,10 @@ Sequentially executes Stages 0 through 11 with built-in error handling,
 dry-run verification gates, timing pause prompts, and user confirmation steps.
 
 Usage:
-    python run_pipeline.py                       # Default run (batch limit: 4, manual prompts)
-    python run_pipeline.py --limit 4             # Standard batch size limit
-    python run_pipeline.py --auto-approve        # Fully automated mode
-    python run_pipeline.py --auto-approve --wait-mins 5 # Short wait gate
+    python run_pipeline.py                               # Interactive mode (default batch limit: 4)
+    python run_pipeline.py --limit 2                    # Custom batch limit (2 MLSs per variant)
+    python run_pipeline.py --auto-approve                # CI/CD Headless mode
+    python run_pipeline.py --auto-approve --wait-mins 5 # Headless mode with 5-minute BigQuery wait gate
 """
 
 import sys
@@ -92,7 +92,7 @@ def main() -> None:
         sys.exit(0)
 
     # ------------------------------------------------------------
-    # STAGES 1 TO 5: Staging Transformation & Bulk Updates
+    # STAGES 1 TO 4: Ingress, Standardization & Target Generation
     # ------------------------------------------------------------
     if not run_stage("1_sync_database_to_repo.py"):
         sys.exit(1)
@@ -106,6 +106,23 @@ def main() -> None:
     if not run_stage("4_generate_targeted_csv.py"):
         sys.exit(1)
 
+    # Check if raw_targeted_rules.csv actually has pending mutation rows
+    targeted_csv = Path("temp-data/raw_targeted_rules.csv")
+    has_mutations = False
+    if targeted_csv.exists():
+        lines = [line.strip() for line in targeted_csv.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if len(lines) > 1:  # More than header row
+            has_mutations = True
+
+    if not has_mutations:
+        logger.info("ℹ️ All target MLS rules are already standardized (no-op batch). Updating ledger directly.")
+        run_stage("11_update_consolidated_repo.py", ["-y"])
+        logger.info("🎉 No DB mutations needed. Ledger updated cleanly.")
+        sys.exit(0)
+
+    # ------------------------------------------------------------
+    # STAGE 5: Staging Transformation & Bulk Updates
+    # ------------------------------------------------------------
     logger.info("Running Stage 5 in DRY-RUN (--debug) mode for safety verification...")
     if not run_stage("5_run_bulk_update.py", ["--input-file", "temp-data/raw_targeted_rules.csv", "--debug"]):
         sys.exit(1)
@@ -141,7 +158,7 @@ def main() -> None:
         sys.exit(1)
 
     # ------------------------------------------------------------
-    # STAGE 8: Trigger Manual Downloads
+    # STAGE 8: Re-Enable Jobs & Trigger Downloads
     # ------------------------------------------------------------
     if not run_stage("8_trigger_manual_downloads.py"):
         sys.exit(1)

@@ -36,7 +36,14 @@ API_BASE_URL = os.getenv(
 ).strip().strip("'\"").rstrip("/")
 
 API_KEY = os.getenv("MLS_ADMIN_STAGE_API_KEY") or os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
-DELETED_BY_USER = os.getenv("UPDATED_BY_USER") or os.getenv("DB_USER", "shrisha.vanga@kw.com")
+
+# Dynamic User Fallback
+DELETED_BY_USER = (
+    os.getenv("UPDATED_BY_USER") or
+    os.getenv("CREATED_BY_USER") or
+    os.getenv("DB_USER") or
+    "migration_pipeline_bot"
+).strip().strip("'\"")
 
 HEADERS = {
     "accept": "application/json",
@@ -69,15 +76,15 @@ def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
     Connects to Staging DB over SSH tunnel to check if rules are still referenced by ANY active MLS mapping.
     Uses LOWER() matching to guard against rule name casing variations.
     """
-    ssh_host = (os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
-    ssh_user = (os.getenv("REMOTE_SSH_USER") or os.getenv("SSH_USER", "")).strip("'\"")
-    ssh_key_path = (os.getenv("REMOTE_SSH_KEY_PATH") or os.getenv("SSH_KEY_PATH", "")).strip("'\"")
-    ssh_passphrase = (os.getenv("REMOTE_SSH_KEY_PASSPHRASE") or os.getenv("SSH_KEY_PASSPHRASE", "")).strip("'\"")
+    ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
+    ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
+    ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
+    ssh_passphrase = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
 
-    db_host = os.getenv("DB_HOST", "").strip("'\"")
-    db_name = os.getenv("DB_NAME", "").strip("'\"")
-    db_user = os.getenv("DB_USER", "shrisha_vanga").strip("'\"")
-    db_pass = os.getenv("DB_PASSWORD", "").strip("'\"")
+    db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
+    db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
+    db_user = (os.getenv("DB_USER", "")).strip("'\"")
+    db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
 
     usage_counts = {name: 0 for name in rule_names}
     lowercased_targets = [name.lower() for name in rule_names]

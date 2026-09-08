@@ -2,12 +2,14 @@
 Pipeline Stage 1: Core Database Ingress Sync Framework.
 
 Establishes a secure SSH tunnel to staging infrastructure to extract raw
-rule records (`public.process_rule`) and write them to disk concurrently.
+rule records (`public.process_rule`) and write them to disk concurrently
+under 'ui-rules/active/' and 'ui-rules/archived/'.
 """
 
 import os
 import io
 import re
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -22,7 +24,8 @@ from pipeline_logger import setup_logger
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
-load_dotenv()
+current_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage1_DBSync")
 
 
@@ -47,23 +50,27 @@ def sanitize_filename(raw_name: str) -> str:
 
 
 def sync_database_to_repo():
-    repo_base_raw = os.getenv("REPO_PATH", "")
+    repo_base_raw = os.getenv("REPO_PATH", "") or os.getenv("UI_RULES_DIR", "")
     repo_base = repo_base_raw.strip().strip("'\"")
     if not repo_base:
-        logger.error("REPO_PATH not set in environment.")
-        return
+        # Fallback to local sibling directory
+        repo_base = str(current_dir.parent / "dm-consolidated-rules")
 
-    ssh_host = os.getenv("SSH_HOST", "").strip().strip("'\"")
-    ssh_user = os.getenv("SSH_USER", "").strip().strip("'\"")
-    ssh_key_path = os.getenv("SSH_KEY_PATH", "").strip().strip("'\"")
-    ssh_passphrase = os.getenv("SSH_KEY_PASSPHRASE", "").strip().strip("'\"")
+    # Staging SSH & DB Configuration with Fallbacks
+    ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
+    ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
+    ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
+    ssh_passphrase = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
 
-    db_host = os.getenv("DB_HOST", "").strip().strip("'\"")
-    db_name = os.getenv("DB_NAME", "").strip().strip("'\"")
-    db_user = os.getenv("DB_USER", "").strip().strip("'\"")
-    db_pass = os.getenv("DB_PASSWORD", "").strip().strip("'\"")
+    db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
+    db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
+    db_user = (os.getenv("DB_USER", "")).strip("'\"")
+    db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
 
     ui_rules_root = Path(repo_base) / "ui-rules"
+    if not ui_rules_root.exists() and (Path(repo_base) / "active").exists():
+        ui_rules_root = Path(repo_base)
+
     active_base = ui_rules_root / "active"
     archived_base = ui_rules_root / "archived"
 
@@ -108,7 +115,8 @@ def sync_database_to_repo():
             ) as conn:
                 conn.set_session(isolation_level="REPEATABLE READ", readonly=True)
 
-                with conn.cursor(name="rule_pull_streaming_cursor") as streaming_cur:
+                cursor_name = f"rule_pull_streaming_cursor_{int(time.time())}"
+                with conn.cursor(name=cursor_name) as streaming_cur:
                     streaming_cur.itersize = 200
                     streaming_cur.execute(
                         "SELECT name, content, deleted_at FROM public.process_rule;"

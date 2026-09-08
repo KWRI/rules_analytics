@@ -24,12 +24,23 @@ current_dir = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage9_VerifyAndEnableAPI")
 
+# Locate GCP Credentials File if present
+gcp_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip().strip("'\"")
+if gcp_creds_path and not Path(gcp_creds_path).is_absolute():
+    gcp_creds_path = str(current_dir / gcp_creds_path)
+
+if gcp_creds_path and os.path.exists(gcp_creds_path):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = gcp_creds_path
+
 # ==============================================================================
 # ENVIRONMENT CONSTANTS
 # ==============================================================================
 MLS_ADMIN_PROD_URL = os.getenv("MLS_ADMIN_PROD_URL", "").strip().strip("'\"").rstrip("/")
 PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
 API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
+
+# Strictly use DB_USER for audit attribution
+UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("'\"")
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "stream-listing-prod").strip().strip("'\"")
 BQ_DATASET = "mls_download"
@@ -88,7 +99,10 @@ def enable_api_jobs(session: requests.Session, mls_ids: list[int]) -> bool:
         "Content-Type": "application/json"
     }
 
-    payload = {"mls_ids": mls_ids}
+    payload = {
+        "mls_ids": mls_ids,
+        "updated_by": UPDATED_BY_USER
+    }
 
     try:
         response = session.post(url, headers=headers, json=payload, timeout=30)
@@ -158,7 +172,12 @@ def main():
         return
 
     # 1. BigQuery Data Landing Verification
-    bq_client = bigquery.Client(project=GCP_PROJECT_ID)
+    try:
+        bq_client = bigquery.Client(project=GCP_PROJECT_ID)
+    except Exception as err:
+        logger.error(f"❌ Failed to initialize BigQuery Client: {err}", exc_info=True)
+        return
+
     mls_verified_map = {}
 
     logger.info("============================================================")

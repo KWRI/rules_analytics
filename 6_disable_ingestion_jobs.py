@@ -1,8 +1,8 @@
 """
 Pipeline Stage 6: Multi-Protocol Ingestion Job Disabler & Scheduler Sync.
 
-Parses target batch files ('temp-data/batch_mls_targets_rets.csv' and 'temp-data/batch_mls_targets_api.csv')
-and disables download jobs based on 'download_protocol':
+Parses target batch files ('temp-data/batch_mls_targets_rets.csv', 'temp-data/batch_mls_targets_api.csv',
+or 'temp-data/batch_mls_targets.csv') and disables download jobs based on 'download_protocol':
   - RETS Integration: Disables target Jenkins jobs over the Jenkins HTTP API using mls_id & mls_id_str patterns.
   - API Integration: Disables target API download jobs via production numeric mls_id payloads AND triggers Scheduler Sync.
 
@@ -18,7 +18,8 @@ from dotenv import load_dotenv
 
 from pipeline_logger import setup_logger
 
-load_dotenv()
+current_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage6_DisableIngestionJobs")
 
 # Jenkins Config (RETS)
@@ -32,7 +33,9 @@ PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0] if "/v1/mls-admin" 
 
 API_BASE_URL = MLS_ADMIN_PROD_URL
 MLS_ADMIN_API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
-UPDATED_BY_USER = os.getenv("UPDATED_BY_USER", "shrisha.vanga@kw.com")
+
+# Strictly use DB_USER for audit attribution
+UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("'\"")
 
 
 # ==============================================================================
@@ -183,7 +186,6 @@ def process_api_disabling(api_targets: set):
     logger.info(f"⚙️ [API BLOCK] Processing {len(api_targets)} unique target MLS(s) via API Service...")
     logger.info("------------------------------------------------------------")
 
-    # API endpoints only require the numeric mls_id
     mls_ids = sorted([int(mls_id) for mls_id, _ in api_targets if mls_id.isdigit()])
     if not mls_ids:
         logger.warning("No valid numeric MLS IDs found for API targets.")
@@ -201,12 +203,12 @@ def process_api_disabling(api_targets: set):
 # ==============================================================================
 
 def run_job_disabling():
-    project_dir = Path(__file__).resolve().parent
-    temp_data_dir = project_dir / "temp-data"
+    temp_data_dir = current_dir / "temp-data"
 
     target_csv_files = [
         temp_data_dir / "batch_mls_targets_rets.csv",
         temp_data_dir / "batch_mls_targets_api.csv",
+        temp_data_dir / "batch_mls_targets.csv",
     ]
 
     rets_targets = set()
@@ -228,7 +230,7 @@ def run_job_disabling():
 
                 if "rets" in protocol:
                     rets_targets.add((mls_id, mls_id_str))
-                elif "api" in protocol:
+                elif any(p in protocol for p in ["api", "rest", "oauth"]):
                     api_targets.add((mls_id, mls_id_str))
                 else:
                     if "rets" in csv_path.name:

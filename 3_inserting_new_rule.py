@@ -29,14 +29,13 @@ from pipeline_logger import setup_logger
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
-# Load environment variables
-load_dotenv()
+current_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage3_RegisterRules")
 
 
 def register_rules_via_microservice():
-    project_dir = Path(__file__).resolve().parent
-    temp_data_dir = project_dir / "temp-data"
+    temp_data_dir = current_dir / "temp-data"
     blueprint_path = temp_data_dir / "migration_blueprint.csv"
 
     if not blueprint_path.exists():
@@ -89,20 +88,24 @@ def register_rules_via_microservice():
     else:
         logger.info(f"🚀 [FULL PRODUCTION MODE] Registering {len(migrations_to_execute)} rules via microservice...")
 
-    # Fetch source content & metadata over SSH DB connection
-    ssh_host = os.getenv("SSH_HOST", "").strip().strip("'\"")
-    ssh_user = os.getenv("SSH_USER", "").strip().strip("'\"")
-    ssh_key_path = os.getenv("SSH_KEY_PATH", "").strip().strip("'\"")
-    ssh_passphrase = os.getenv("SSH_KEY_PASSPHRASE", "").strip().strip("'\"")
+    # Staging SSH & DB Configuration with Fallbacks
+    ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
+    ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
+    ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
+    ssh_passphrase = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
 
-    db_host = os.getenv("DB_HOST", "").strip().strip("'\"")
-    db_name = os.getenv("DB_NAME", "").strip().strip("'\"")
-    db_user = os.getenv("DB_USER", "").strip().strip("'\"")
-    db_pass = os.getenv("DB_PASSWORD", "").strip().strip("'\"")
+    db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
+    db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
+    db_user = (os.getenv("DB_USER", "")).strip("'\"")
+    db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
 
     registered_count = 0
     skipped_count = 0
-    created_by_user = os.getenv("CREATED_BY_USER", db_user or "shrisha_vanga").strip().strip("'\"")
+    created_by_user = (
+        os.getenv("CREATED_BY_USER") or
+        os.getenv("UPDATED_BY_USER") or
+        db_user
+    ).strip().strip("'\"")
 
     try:
         with open(ssh_key_path, "rb") as key_file:
@@ -171,17 +174,20 @@ def register_rules_via_microservice():
                             "api-key": api_key,
                         }
 
-                        res = requests.post(rules_endpoint, json=payload, headers=headers)
+                        try:
+                            res = requests.post(rules_endpoint, json=payload, headers=headers, timeout=15)
 
-                        if res.status_code in [200, 201]:
-                            res_data = res.json()
-                            logger.info(f"Created '{new_name}' | ID: {res_data.get('id')}")
-                            registered_count += 1
-                        elif res.status_code == 409 or "already exists" in res.text.lower():
-                            logger.info(f"Skipped '{new_name}' (Already exists)")
-                            skipped_count += 1
-                        else:
-                            logger.error(f"Failed to create '{new_name}' [{res.status_code}]: {res.text}")
+                            if res.status_code in [200, 201]:
+                                res_data = res.json()
+                                logger.info(f"Created '{new_name}' | ID: {res_data.get('id')}")
+                                registered_count += 1
+                            elif res.status_code == 409 or "already exists" in res.text.lower():
+                                logger.info(f"Skipped '{new_name}' (Already exists)")
+                                skipped_count += 1
+                            else:
+                                logger.error(f"Failed to create '{new_name}' [{res.status_code}]: {res.text}")
+                        except requests.RequestException as req_err:
+                            logger.error(f"HTTP request exception for '{new_name}': {req_err}")
 
                     logger.info("============================================================")
                     logger.info("🚀 STAGE 3 COMPLETE: MICROSERVICE RULE REGISTRATION FINISHED")

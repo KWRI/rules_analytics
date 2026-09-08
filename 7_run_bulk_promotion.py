@@ -2,7 +2,8 @@
 Pipeline Stage 7: Bulk Production Promotion Engine.
 
 Promotes newly standardized rules, schema maps, and metadata to the Production environment:
-1. Reads active target numeric MLS IDs directly from 'temp-data/promotion_sources.txt'.
+1. Reads active target numeric MLS IDs directly from 'temp-data/promotion_sources.txt'
+   (or automatically builds it from Stage 0/4 targets if missing).
 2. Stages the manifest file on the remote deployment server over SFTP.
 3. Invokes an interactive SSH shell to execute remote promotion commands ('s_p',
    'set_promotion stage prod', and 'promote_source.py').
@@ -13,12 +14,14 @@ Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 import os
 import sys
 import io
+import csv
 import time
 import paramiko
 from pathlib import Path
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import serialization
 
+from rules_utils import load_target_mls
 from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
@@ -36,6 +39,49 @@ REMOTE_MANIFEST_PATH = os.getenv(
     "REMOTE_MANIFEST_PATH",
     "/eim-mls-admin-ms/devtools/source_promotion/promotion_sources.txt"
 )
+
+
+def ensure_promotion_manifest(temp_data_dir: Path) -> Path:
+    """
+    Ensures promotion_sources.txt exists and contains target MLS IDs.
+    If missing or empty, builds it automatically from raw_targeted_rules.csv or Stage 0 manifests.
+    """
+    manifest_path = temp_data_dir / "promotion_sources.txt"
+    target_ids = set()
+
+    # 1. Read existing manifest if present
+    if manifest_path.exists():
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            cleaned = line.strip().strip("'\"")
+            if cleaned.isdigit():
+                target_ids.add(int(cleaned))
+
+    # 2. Fallback: Parse raw_targeted_rules.csv
+    if not target_ids:
+        raw_targeted_csv = temp_data_dir / "raw_targeted_rules.csv"
+        if raw_targeted_csv.exists():
+            with open(raw_targeted_csv, mode="r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    mls_id = row.get("mls_id", "").strip()
+                    if mls_id.isdigit():
+                        target_ids.add(int(mls_id))
+
+    # 3. Fallback: Parse Stage 0 text targets (api_mls.txt, rets_mls.txt)
+    if not target_ids:
+        target_ids = load_target_mls(temp_data_dir)
+
+    # Output verified sorted manifest
+    if target_ids:
+        sorted_ids = sorted(list(target_ids))
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            "\n".join(str(m) for m in sorted_ids) + "\n",
+            encoding="utf-8"
+        )
+        logger.info(f"✅ Promotion manifest validated with {len(sorted_ids)} target MLS ID(s): {sorted_ids}")
+
+    return manifest_path
 
 
 def get_target_mls_ids(manifest_path: Path) -> list[int]:
@@ -67,12 +113,13 @@ def main() -> None:
     logger.info("🚀 STAGE 7: PRODUCTION PROMOTION ENGINE INITIALIZED")
     logger.info("============================================================")
 
-    local_manifest = current_dir / "temp-data" / "promotion_sources.txt"
+    temp_data_dir = current_dir / "temp-data"
+    local_manifest = ensure_promotion_manifest(temp_data_dir)
     mls_ids = get_target_mls_ids(local_manifest)
 
     if not mls_ids:
-        logger.error(f"❌ No valid numeric MLS IDs found in '{local_manifest}'. Aborting promotion.")
-        sys.exit(1)
+        logger.info("ℹ️ No pending target MLS IDs found in promotion manifest. Skipping Stage 7 promotion.")
+        sys.exit(0)
 
     logger.info(f"🎯 [PROMOTION BATCH GUARD] Target MLS IDs loaded from manifest ({len(mls_ids)}): {mls_ids}")
 

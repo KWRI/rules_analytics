@@ -1,8 +1,8 @@
 """
 Pipeline Stage 8: Multi-Protocol Ingestion Job Enabler & Trigger Engine (Parallelized & Robust).
 
-Parses target batch files ('temp-data/batch_mls_targets_rets.csv' and 'temp-data/batch_mls_targets_api.csv')
-and triggers ingestion downloads in parallel:
+Parses target batch files ('temp-data/batch_mls_targets_rets.csv', 'temp-data/batch_mls_targets_api.csv',
+or 'temp-data/batch_mls_targets.csv') and triggers ingestion downloads in parallel:
   - RETS Integration: Enables Jenkins jobs, triggers 'buildWithParameters' (LOAD_TYPE=incr),
                       and polls execution status until completion concurrently.
   - API Integration: Triggers 3-day manual reprocess downloads via Production Microservice API,
@@ -300,7 +300,6 @@ def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str
                 )
                 return None
 
-            # Handle intermittent microservice KeyError locks with backoff (2s, 4s, 6s)
             elif response.status_code == 404 and "KeyError" in response.text and attempt < max_retries:
                 backoff = attempt * 2
                 logger.warning(
@@ -355,7 +354,6 @@ def process_api_triggers_parallel(api_targets: list[dict]):
     total_triggered = 0
     total_failed = 0
 
-    # Group targets by MLS ID so payloads for the same source run sequentially
     grouped_by_mls = {}
     for t in api_targets:
         grouped_by_mls.setdefault(t["mls_id"], []).append(t)
@@ -364,7 +362,7 @@ def process_api_triggers_parallel(api_targets: list[dict]):
         group_records = []
         for idx, t in enumerate(targets_list):
             if idx > 0:
-                time.sleep(1.5)  # 1.5s pause between listing & open_house for the same source
+                time.sleep(1.5)
             res = trigger_api_download(
                 session,
                 t["mls_id"],
@@ -376,7 +374,6 @@ def process_api_triggers_parallel(api_targets: list[dict]):
                 group_records.append(res)
         return group_records
 
-    # Execute different MLS sources concurrently, but payloads per MLS serially
     with ThreadPoolExecutor(max_workers=min(len(grouped_by_mls), MAX_PARALLEL_WORKERS)) as executor:
         future_to_mls = {
             executor.submit(process_mls_group, targets): mls_id
@@ -410,42 +407,45 @@ def main():
     logger.info("============================================================")
 
     temp_data_dir = current_dir / "temp-data"
-    rets_csv_path = temp_data_dir / "batch_mls_targets_rets.csv"
-    api_csv_path = temp_data_dir / "batch_mls_targets_api.csv"
+    target_csv_files = [
+        temp_data_dir / "batch_mls_targets_rets.csv",
+        temp_data_dir / "batch_mls_targets_api.csv",
+        temp_data_dir / "batch_mls_targets.csv",
+    ]
 
     rets_targets = set()
     api_targets_dict = {}
 
-    # 1. Parse RETS Targets
-    if rets_csv_path.exists():
-        with open(rets_csv_path, mode="r", encoding="utf-8") as f:
+    for csv_path in target_csv_files:
+        if not csv_path.exists():
+            continue
+
+        with open(csv_path, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                mls_id = row.get("mls_id", "").strip()
+                mls_id_raw = row.get("mls_id", "").strip()
                 mls_id_str = row.get("mls_id_str", "").strip()
-                if mls_id and mls_id_str:
-                    rets_targets.add((mls_id, mls_id_str))
+                protocol = row.get("download_protocol", "").strip().lower()
 
-    # 2. Parse API Targets
-    if api_csv_path.exists():
-        with open(api_csv_path, mode="r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if not row.get("mls_id"):
+                if not mls_id_raw or not mls_id_str:
                     continue
-                mls_id = int(row["mls_id"].strip())
-                mls_id_str = row.get("mls_id_str", f"ID_{mls_id}").strip()
-                content_type = row.get("content_type", "").strip()
-                content_sub_type = row.get("content_sub_type", "").strip()
 
-                key = (mls_id, content_type, content_sub_type)
-                if key not in api_targets_dict:
-                    api_targets_dict[key] = {
-                        "mls_id": mls_id,
-                        "mls_id_str": mls_id_str,
-                        "content_type": content_type,
-                        "content_sub_type": content_sub_type,
-                    }
+                if "rets" in protocol or "rets" in csv_path.name:
+                    rets_targets.add((mls_id_raw, mls_id_str))
+                elif any(p in protocol for p in ["api", "rest", "oauth"]) or "api" in csv_path.name:
+                    if mls_id_raw.isdigit():
+                        mls_id = int(mls_id_raw)
+                        content_type = row.get("content_type", "").strip()
+                        content_sub_type = row.get("content_sub_type", "").strip()
+                        key = (mls_id, content_type, content_sub_type)
+
+                        if key not in api_targets_dict:
+                            api_targets_dict[key] = {
+                                "mls_id": mls_id,
+                                "mls_id_str": mls_id_str,
+                                "content_type": content_type,
+                                "content_sub_type": content_sub_type,
+                            }
 
     api_targets = list(api_targets_dict.values())
 
