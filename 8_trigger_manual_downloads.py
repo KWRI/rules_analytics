@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / ".env")
+load_dotenv(dotenv_path=current_dir / "..env")
 logger = setup_logger("Stage8_TriggerDownload")
 
 # ==============================================================================
@@ -346,7 +346,7 @@ def process_api_triggers_parallel(api_targets: list[dict]):
     logger.info("------------------------------------------------------------")
 
     if not API_KEY:
-        logger.error("❌ API_KEY / MLS_ADMIN_API_KEY missing from .env file.")
+        logger.error("❌ API_KEY / MLS_ADMIN_API_KEY missing from ..env file.")
         return
 
     session = create_robust_session()

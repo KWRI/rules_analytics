@@ -7,7 +7,7 @@ promotion_sources.txt
 # Virtual Environments
 .venv/
 venv/
-ENV/
+.env/
 
 # Sensitive Environment & Secrets (DO NOT PUSH KEYS/PASSWORDS)
 .env

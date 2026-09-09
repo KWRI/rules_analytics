@@ -6,7 +6,7 @@ rules via the MLS Admin Microservice (`POST /rules`). This automatically handles
 generation, populates language/group associations, and immediately invalidates UI caches.
 
 Supports target batch mode via 'temp-data/api_rules.txt' and/or 'temp-data/rets_rules.txt'
-(via rules_utils.py) or single-rule mode via the `TARGET_RULE_NAME` env variable.
+(via rules_utils.py) or single-rule mode via the `TARGET_RULE_NAME` .env variable.
 Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 """
 
@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / ".env")
+load_dotenv(dotenv_path=current_dir / "..env")
 logger = setup_logger("Stage3_RegisterRules")
 
 
@@ -55,7 +55,7 @@ def register_rules_via_microservice():
     stage_url = stage_url_raw.strip().strip("'\"").rstrip("/")
     rules_endpoint = f"{stage_url}/rules"
 
-    # Check for target batch files or single rule env var
+    # Check for target batch files or single rule .env var
     target_batch_rules = load_target_rules(temp_data_dir)
     env_target_rule = os.getenv("TARGET_RULE_NAME", "").strip().strip("'\"") or None
 

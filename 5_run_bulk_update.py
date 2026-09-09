@@ -33,17 +33,17 @@ for key in list(os.environ.keys()):
 
 # 2. Force load ONLY the bulk tool environment variables
 current_dir = Path(__file__).resolve().parent
-bulk_env_path = current_dir / ".env.bulk"
+bulk_env_path = current_dir / "...env.bulk"
 if bulk_env_path.exists():
     load_dotenv(dotenv_path=bulk_env_path, override=True)
 
-# 3. Base paths loaded dynamically from .env.bulk
+# 3. Base paths loaded dynamically from ...env.bulk
 tools_repo = os.getenv("TOOLS_REPO_PATH")
 utils_repo = os.getenv("UTILS_REPO_PATH")
 snowflake_repo = os.getenv("SNOWFLAKE_REPO_PATH")
 
 if not tools_repo or not utils_repo:
-    logger.error("TOOLS_REPO_PATH or UTILS_REPO_PATH missing from .env.bulk configuration.")
+    logger.error("TOOLS_REPO_PATH or UTILS_REPO_PATH missing from ...env.bulk configuration.")
     sys.exit(1)
 
 # 4. Core path injections
@@ -61,7 +61,7 @@ import pydantic_settings
 
 class CleanSettings(pydantic_settings.BaseSettings):
     model_config = pydantic_settings.SettingsConfigDict(
-        env_file=None,  # Hard block against reading physical .env file
+        env_file=None,  # Hard block against reading physical ..env file
         extra="ignore"  # Ignore extra keys instead of crashing
     )
 

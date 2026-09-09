@@ -13,6 +13,11 @@ import psycopg2
 import paramiko
 from sshtunnel import SSHTunnelForwarder
 from cryptography.hazmat.primitives import serialization
+from dotenv import load_dotenv
+
+# Force load .env from the project root directory
+current_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=current_dir / ".env")
 
 
 def load_target_rules(temp_data_dir: Path) -> set[str]:
@@ -165,18 +170,31 @@ def get_live_active_prod_mls(logger=None) -> set[int]:
     Queries Production DB in real time for all currently active MLS sources (mls_status_id = 2).
     Always returns fresh state to seamlessly handle status flips across pipeline runs.
     """
-    prod_ssh_host = (os.getenv("PROD_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
-    prod_ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
-    prod_ssh_key = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
-    prod_ssh_pass = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
+    # Force reload .env to ensure fresh runtime state
+    load_dotenv(dotenv_path=current_dir / ".env")
 
-    prod_db_host = (os.getenv("PROD_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
-    prod_db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
-    prod_db_user = (os.getenv("DB_USER", "")).strip("'\"")
-    prod_db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
+    # Read variables matching exact .env key signatures
+    prod_ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip().strip("'\"")
+    prod_ssh_user = os.getenv("SSH_USER", "").strip().strip("'\"")
+    prod_ssh_key = os.getenv("SSH_KEY_PATH", "").strip().strip("'\"")
+    prod_ssh_pass = os.getenv("SSH_KEY_PASSPHRASE", "").strip().strip("'\"")
+
+    prod_db_host = os.getenv("PROD_DB_HOST", "").strip().strip("'\"")
+    prod_db_name = os.getenv("DB_NAME", "mls_admin").strip().strip("'\"")
+    prod_db_user = os.getenv("DB_USER", "").strip().strip("'\"")
+    prod_db_pass = os.getenv("DB_PASSWORD", "").strip().strip("'\"")
 
     if logger:
         logger.info("🔍 Fetching live active MLS IDs from Production DB (mls_status_id = 2)...")
+
+    # Guardrail check to provide clear feedback instead of crashing with FileNotFoundError
+    if not prod_ssh_key or not os.path.exists(prod_ssh_key):
+        if logger:
+            logger.error(
+                f"❌ Invalid or missing SSH key path: '{prod_ssh_key}'. "
+                f"Please verify SSH_KEY_PATH in your .env file."
+            )
+        return set()
 
     active_prod_ids = set()
 

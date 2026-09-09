@@ -31,18 +31,30 @@ cd rules_analytics
 ```
 
 2. **Set up a Virtual Environment:**
+
+Ensure you have Python 3.12 installed before creating your environment to guarantee compatibility with all pre-compiled binary dependencies (such as `psycopg2-binary` and `Django 6.x`).
+
 ```bash
-python -m venv .venv
+# Windows (PowerShell / CMD):
+py -3.12 -m venv .venv
 
-# On Windows:
-.venv\Scripts\activate
+# macOS / Linux:
+python3.12 -m venv .venv
 
-# On macOS/Linux:
+# Activate the environment:
+# Windows (PowerShell):
+.\.venv\Scripts\Activate.ps1
+
+# Windows (Git Bash):
+source .venv/Scripts/activate
+
+# macOS / Linux:
 source .venv/bin/activate
 ```
 
 3. **Install Dependencies:**
 ```bash
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 

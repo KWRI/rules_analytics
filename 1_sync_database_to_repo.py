@@ -50,22 +50,25 @@ def sanitize_filename(raw_name: str) -> str:
 
 
 def sync_database_to_repo():
+    # Reload .env explicitly to guarantee fresh state
+    load_dotenv(dotenv_path=current_dir / ".env")
+
     repo_base_raw = os.getenv("REPO_PATH", "") or os.getenv("UI_RULES_DIR", "")
     repo_base = repo_base_raw.strip().strip("'\"")
     if not repo_base:
         # Fallback to local sibling directory
         repo_base = str(current_dir.parent / "dm-consolidated-rules")
 
-    # Staging SSH & DB Configuration with Fallbacks
-    ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
-    ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
-    ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
-    ssh_passphrase = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
+    # Staging SSH & DB Configuration matching .env key signatures
+    ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip().strip("'\"")
+    ssh_user = os.getenv("SSH_USER", "").strip().strip("'\"")
+    ssh_key_path = os.getenv("SSH_KEY_PATH", "").strip().strip("'\"")
+    ssh_passphrase = os.getenv("SSH_KEY_PASSPHRASE", "").strip().strip("'\"")
 
-    db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
-    db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
-    db_user = (os.getenv("DB_USER", "")).strip("'\"")
-    db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
+    db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip().strip("'\"")
+    db_name = os.getenv("DB_NAME", "mls_admin").strip().strip("'\"")
+    db_user = os.getenv("DB_USER", "").strip().strip("'\"")
+    db_pass = os.getenv("DB_PASSWORD", "").strip().strip("'\"")
 
     ui_rules_root = Path(repo_base) / "ui-rules"
     if not ui_rules_root.exists() and (Path(repo_base) / "active").exists():
@@ -76,6 +79,14 @@ def sync_database_to_repo():
 
     logger.info("Starting Core Database Ingress Sync...")
     logger.info(f"Target UI Rules Directory: {ui_rules_root}")
+
+    # Guardrail check to verify SSH key file existence
+    if not ssh_key_path or not os.path.exists(ssh_key_path):
+        logger.error(
+            f"❌ Invalid or missing SSH key path: '{ssh_key_path}'. "
+            f"Please verify SSH_KEY_PATH in your .env file."
+        )
+        return
 
     # Reset directories cleanly
     for folder in [active_base, archived_base]:

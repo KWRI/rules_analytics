@@ -25,7 +25,7 @@ from rules_utils import load_target_mls
 from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / ".env")
+load_dotenv(dotenv_path=current_dir / "..env")
 logger = setup_logger("Stage7_BulkPromotion")
 
 # ============================================================
@@ -132,7 +132,7 @@ def main() -> None:
     logger.info(f"[1/4] Connecting to remote host {SSH_HOST}...")
 
     if not SSH_KEY_PATH:
-        logger.error("❌ SSH key path missing from configuration! Check REMOTE_SSH_KEY_PATH or SSH_KEY_PATH in .env.")
+        logger.error("❌ SSH key path missing from configuration! Check REMOTE_SSH_KEY_PATH or SSH_KEY_PATH in ..env.")
         sys.exit(1)
 
     try:

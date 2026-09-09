@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / ".env")
+load_dotenv(dotenv_path=current_dir / "..env")
 logger = setup_logger("Stage0_APIBatchPrepare")
 
 DEFAULT_BATCH_MLS_LIMIT = 5

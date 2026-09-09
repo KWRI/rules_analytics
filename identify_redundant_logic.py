@@ -64,7 +64,7 @@ def safely_delete_dir(dir_path):
 def run_audit():
     repo_path = os.getenv("REPO_PATH")
     if not repo_path:
-        print("Error: REPO_PATH not found in .env")
+        print("Error: REPO_PATH not found in ..env")
         return
 
     source_active = Path(repo_path) / "ui-rules" / "active"
