@@ -33,7 +33,7 @@ for key in list(os.environ.keys()):
 
 # 2. Force load ONLY the bulk tool environment variables
 current_dir = Path(__file__).resolve().parent
-bulk_env_path = current_dir / "...env.bulk"
+bulk_env_path = current_dir / ".env.bulk"
 if bulk_env_path.exists():
     load_dotenv(dotenv_path=bulk_env_path, override=True)
 
