@@ -66,7 +66,7 @@ def get_deleted_rules_set(rule_names: list[str]) -> set[str]:
     lowercased_targets = [name.lower() for name in rule_names]
 
     if not ssh_host or not ssh_key_path:
-        logger.error("❌ SSH parameters missing from ..env file. Unable to verify DB deleted status.")
+        logger.error("❌ SSH parameters missing from .env file. Unable to verify DB deleted status.")
         sys.exit(1)
 
     try:

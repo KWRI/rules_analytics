@@ -16,12 +16,15 @@ import time
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
+
 from google.cloud import bigquery
+import google.auth
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / "..env")
+load_dotenv(dotenv_path=current_dir / ".env", override=True)
 logger = setup_logger("Stage9_VerifyAndEnableAPI")
 
 # Locate GCP Credentials File if present
@@ -44,6 +47,40 @@ UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "stream-listing-prod").strip().strip("'\"")
 BQ_DATASET = "mls_download"
+
+
+# ==============================================================================
+# CREDENTIAL INITIALIZER
+# ==============================================================================
+
+def get_bigquery_client(project_id: str) -> bigquery.Client:
+    """
+    Initializes BigQuery client using local Application Default Credentials (ADC).
+    Falls back to interactive OAuth browser authentication if ADC credentials are not found.
+    """
+    try:
+        credentials, project = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        logger.info("✅ Standard Google Application Default Credentials initialized.")
+        return bigquery.Client(project=project_id, credentials=credentials)
+    except Exception:
+        logger.info("🔑 Local ADC credentials missing. Initiating interactive browser login flow...")
+        flow = InstalledAppFlow.from_client_config(
+            {
+                "installed": {
+                    "client_id": "764086051850-6qr4p5gij6nho282q2sk508p01x08g3a.apps.googleusercontent.com",
+                    "project_id": project_id,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs"
+                }
+            },
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        credentials = flow.run_local_server(port=0)
+        logger.info("✅ Interactive login successful. Tokens generated in memory.")
+        return bigquery.Client(project=project_id, credentials=credentials)
 
 
 # ==============================================================================
@@ -173,7 +210,7 @@ def main():
 
     # 1. BigQuery Data Landing Verification
     try:
-        bq_client = bigquery.Client(project=GCP_PROJECT_ID)
+        bq_client = get_bigquery_client(GCP_PROJECT_ID)
     except Exception as err:
         logger.error(f"❌ Failed to initialize BigQuery Client: {err}", exc_info=True)
         return

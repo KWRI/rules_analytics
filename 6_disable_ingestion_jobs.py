@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / "..env")
+load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage6_DisableIngestionJobs")
 
 # Jenkins Config (RETS)

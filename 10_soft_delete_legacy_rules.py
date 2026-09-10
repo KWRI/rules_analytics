@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives import serialization
 from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / "..env")
+load_dotenv(dotenv_path=current_dir / ".env")
 logger = setup_logger("Stage10_SoftDeleteStage")
 
 # Explicit Stage Environment API Target
@@ -90,7 +90,7 @@ def get_active_rule_usage_counts(rule_names: list[str]) -> dict[str, int]:
     lowercased_targets = [name.lower() for name in rule_names]
 
     if not ssh_host or not ssh_key_path:
-        logger.error("❌ SSH parameters missing from ..env file. Unable to verify DB dependencies.")
+        logger.error("❌ SSH parameters missing from .env file. Unable to verify DB dependencies.")
         sys.exit(1)
 
     try:
