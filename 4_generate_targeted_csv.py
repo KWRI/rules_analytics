@@ -157,6 +157,8 @@ def run_production_extractor():
                 update_ledger_directly(temp_data_dir, target_batch_mls)
         else:
             logger.info("No active rule mutations mapped in the blueprint to extract.")
+        # Ensure promotion_sources.txt is empty if no mutations exist
+        txt_output_path.write_text("", encoding="utf-8")
         return
 
     target_rules_set = set(blueprint_mapping.keys())
@@ -345,11 +347,10 @@ def run_production_extractor():
                                     except ValueError:
                                         pass
 
-                    export_ids = captured_mls_ids or target_batch_mls
-                    if export_ids:
-                        with open(txt_output_path, mode="w", encoding="utf-8") as txt_f:
-                            for unique_id in sorted(list(export_ids)):
-                                txt_f.write(f"{unique_id}\n")
+                    # STRICT MANIFEST GENERATION: Write ONLY sources that actually required mutations
+                    with open(txt_output_path, mode="w", encoding="utf-8") as txt_f:
+                        for unique_id in sorted(list(captured_mls_ids)):
+                            txt_f.write(f"{unique_id}\n")
 
                 if target_batch_mls:
                     no_op_mls_ids = target_batch_mls.difference(captured_mls_ids)

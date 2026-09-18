@@ -89,7 +89,18 @@ def get_bigquery_client(project_id: str) -> bigquery.Client:
 
 def verify_batch_landing_bq(client: bigquery.Client, content_type: str, mls_id: int, batch_id: str, max_attempts: int = 5, sleep_sec: int = 10) -> int:
     """Queries BigQuery to verify rows landed for a batch ID, polling to allow streaming buffer flushes."""
-    table_name = "listing" if content_type.lower() == "listing" else "open_house"
+    ct_clean = content_type.lower()
+    if ct_clean == "listing":
+        table_name = "listing"
+    elif ct_clean in ["open_house", "openhouse"]:
+        table_name = "open_house"
+    elif ct_clean == "office":
+        table_name = "office"
+    elif ct_clean in ["agent", "member"]:
+        table_name = "agent"
+    else:
+        table_name = ct_clean
+
     table_id = f"{GCP_PROJECT_ID}.{BQ_DATASET}.{table_name}"
 
     query = f"""
@@ -188,7 +199,7 @@ def main():
     triggered_log_path = current_dir / "temp-data" / "triggered_downloads_log_api.csv"
 
     if not triggered_log_path.exists():
-        logger.warning("No API trigger log found ('temp-data/triggered_downloads_log_api.csv'). Skipping Stage 9.")
+        logger.info("ℹ️ No API trigger log found ('temp-data/triggered_downloads_log_api.csv'). Skipping Stage 9.")
         return
 
     triggered_records = []
@@ -205,7 +216,7 @@ def main():
                 })
 
     if not triggered_records:
-        logger.warning("Trigger log CSV is empty. No API batch IDs to verify.")
+        logger.info("ℹ️ Trigger log CSV is empty. No API batch IDs to verify.")
         return
 
     # 1. BigQuery Data Landing Verification

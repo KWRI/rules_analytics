@@ -81,7 +81,12 @@ try:
     if sf_inner:
         sf_constants_path = os.path.join(sf_inner, "constants.py")
         if os.path.exists(sf_constants_path):
-            for target_mod in ["eim_snowflake_id.constants", "eim_snowfllake_id.constants"]:
+            target_modules = [
+                "eim_snowflake_id.constants",
+                "eim_snowfllake_id.constants",
+                "snowflake_id.constants"
+            ]
+            for target_mod in target_modules:
                 spec = importlib.util.spec_from_file_location(target_mod, sf_constants_path)
                 mod = importlib.util.module_from_spec(spec)
                 sys.modules[target_mod] = mod
@@ -136,3 +141,7 @@ if __name__ == "__main__":
         logger.error(f"Missing Internal System Library Dependency: {e}", exc_info=True)
     except Exception as err:
         logger.error(f"Execution failure during runtime mapping sequence: {err}", exc_info=True)
+    except SystemExit as se:
+        if se.code != 0:
+            logger.error(f"bulk_map_tool exited with non-zero status code: {se.code}")
+            sys.exit(se.code)

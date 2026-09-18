@@ -2,7 +2,8 @@
 Pipeline Stage 6: Multi-Protocol Ingestion Job Disabler & Scheduler Sync.
 
 Parses target batch files ('temp-data/batch_mls_targets_rets.csv', 'temp-data/batch_mls_targets_api.csv',
-or 'temp-data/batch_mls_targets.csv') and disables download jobs based on 'download_protocol':
+or 'temp-data/batch_mls_targets.csv') AND filters strictly against 'temp-data/promotion_sources.txt'.
+Disables download jobs based on 'download_protocol':
   - RETS Integration: Disables target Jenkins jobs over the Jenkins HTTP API using mls_id & mls_id_str patterns.
   - API Integration: Disables target API download jobs via production numeric mls_id payloads AND triggers Scheduler Sync.
 
@@ -36,6 +37,20 @@ MLS_ADMIN_API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
 
 # Strictly use DB_USER for audit attribution
 UPDATED_BY_USER = os.getenv("DB_USER", "migration_pipeline_bot").strip().strip("'\"")
+
+
+def load_promoted_mls_ids(temp_data_dir: Path) -> set[int]:
+    """Reads unique numeric MLS IDs strictly from promotion_sources.txt."""
+    manifest_path = temp_data_dir / "promotion_sources.txt"
+    if not manifest_path.exists():
+        logger.warning(f"⚠️ Promotion manifest not found at '{manifest_path}'. Filtering fallback active.")
+        return set()
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        promoted_ids = {int(line.strip()) for line in f if line.strip().isdigit()}
+
+    logger.info(f"🎯 Loaded {len(promoted_ids)} promoted MLS ID(s) from 'promotion_sources.txt': {sorted(list(promoted_ids))}")
+    return promoted_ids
 
 
 # ==============================================================================
@@ -97,7 +112,7 @@ def process_rets_disabling(rets_targets: set):
 
     matched_jobs_dict = {}
     for mls_id, mls_id_str in rets_targets:
-        pattern = re.compile(rf"^{re.escape(mls_id)}-{re.escape(mls_id_str)}.*")
+        pattern = re.compile(rf"^{re.escape(str(mls_id))}-{re.escape(str(mls_id_str))}.*")
         for job in jenkins_jobs:
             if pattern.match(job["name"]):
                 matched_jobs_dict[job["name"]] = job
@@ -186,7 +201,7 @@ def process_api_disabling(api_targets: set):
     logger.info(f"⚙️ [API BLOCK] Processing {len(api_targets)} unique target MLS(s) via API Service...")
     logger.info("------------------------------------------------------------")
 
-    mls_ids = sorted([int(mls_id) for mls_id, _ in api_targets if mls_id.isdigit()])
+    mls_ids = sorted([int(mls_id) for mls_id, _ in api_targets if str(mls_id).isdigit()])
     if not mls_ids:
         logger.warning("No valid numeric MLS IDs found for API targets.")
         return
@@ -205,6 +220,9 @@ def process_api_disabling(api_targets: set):
 def run_job_disabling():
     temp_data_dir = current_dir / "temp-data"
 
+    # Load promoted MLS IDs strictly from promotion_sources.txt if available
+    promoted_mls_ids = load_promoted_mls_ids(temp_data_dir)
+
     target_csv_files = [
         temp_data_dir / "batch_mls_targets_rets.csv",
         temp_data_dir / "batch_mls_targets_api.csv",
@@ -221,11 +239,17 @@ def run_job_disabling():
         with open(csv_path, mode="r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                mls_id = row.get("mls_id", "").strip()
+                mls_id_raw = row.get("mls_id", "").strip()
                 mls_id_str = row.get("mls_id_str", "").strip()
                 protocol = row.get("download_protocol", "").strip().lower()
 
-                if not mls_id or not mls_id_str:
+                if not mls_id_raw or not mls_id_str or not mls_id_raw.isdigit():
+                    continue
+
+                mls_id = int(mls_id_raw)
+
+                # STRICT GUARD: If promotion_sources.txt exists, only process promoted sources
+                if promoted_mls_ids and mls_id not in promoted_mls_ids:
                     continue
 
                 if "rets" in protocol:
@@ -241,8 +265,8 @@ def run_job_disabling():
     logger.info("============================================================")
     logger.info("🚀 STAGE 6: DISABLING INGESTION JOBS & SCHEDULER SYNC")
     logger.info("============================================================")
-    logger.info(f"RETS Target Feeds Discovered : {len(rets_targets)}")
-    logger.info(f"API Target Feeds Discovered  : {len(api_targets)}")
+    logger.info(f"Promoted RETS Target Feeds Discovered : {len(rets_targets)}")
+    logger.info(f"Promoted API Target Feeds Discovered  : {len(api_targets)}")
     logger.info("============================================================")
 
     if rets_targets:
@@ -252,7 +276,7 @@ def run_job_disabling():
         process_api_disabling(api_targets)
 
     if not rets_targets and not api_targets:
-        logger.warning("No RETS or API targets discovered in batch CSVs. No jobs were disabled.")
+        logger.warning("No matching promoted RETS or API targets discovered in batch CSVs. No jobs were disabled.")
 
 
 if __name__ == "__main__":

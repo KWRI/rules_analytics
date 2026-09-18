@@ -134,6 +134,7 @@ def sync_database_to_repo():
                     )
 
                     file_count = 0
+                    failed_writes = 0
                     seen_active = {}
                     seen_archived = {}
                     futures = []
@@ -168,12 +169,18 @@ def sync_database_to_repo():
                             file_count += 1
 
                         for future in as_completed(futures):
-                            future.result()
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                failed_writes += 1
+                                logger.error(f"⚠️ Failed to write backup file thread task: {exc}")
 
                     logger.info("============================================================")
                     logger.info("🚀 STAGE 1 COMPLETE: PERFECT REPOSITORY BACKUP SYNC")
                     logger.info("============================================================")
                     logger.info(f"Total Unique Files Written to Disk: {file_count}")
+                    if failed_writes > 0:
+                        logger.warning(f"⚠️ Encountered {failed_writes} file write failure(s).")
                     logger.info("============================================================")
 
     except Exception as e:

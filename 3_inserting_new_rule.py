@@ -13,6 +13,7 @@ Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 import os
 import csv
 import io
+import time
 import warnings
 from pathlib import Path
 import psycopg2
@@ -168,26 +169,39 @@ def register_rules_via_microservice():
                             "groups": groups_payload,
                         }
 
-                        # 3. Post to microservice endpoint
+                        # 3. Post to microservice endpoint with retry backoff
                         headers = {
                             "Content-Type": "application/json",
                             "api-key": api_key,
                         }
 
-                        try:
-                            res = requests.post(rules_endpoint, json=payload, headers=headers, timeout=15)
+                        success = False
+                        for attempt in range(1, 4):
+                            try:
+                                res = requests.post(rules_endpoint, json=payload, headers=headers, timeout=30)
 
-                            if res.status_code in [200, 201]:
-                                res_data = res.json()
-                                logger.info(f"Created '{new_name}' | ID: {res_data.get('id')}")
-                                registered_count += 1
-                            elif res.status_code == 409 or "already exists" in res.text.lower():
-                                logger.info(f"Skipped '{new_name}' (Already exists)")
-                                skipped_count += 1
-                            else:
-                                logger.error(f"Failed to create '{new_name}' [{res.status_code}]: {res.text}")
-                        except requests.RequestException as req_err:
-                            logger.error(f"HTTP request exception for '{new_name}': {req_err}")
+                                if res.status_code in [200, 201]:
+                                    res_data = res.json()
+                                    logger.info(f"Created '{new_name}' | ID: {res_data.get('id')}")
+                                    registered_count += 1
+                                    success = True
+                                    break
+                                elif res.status_code == 409 or "already exists" in res.text.lower():
+                                    logger.info(f"Skipped '{new_name}' (Already exists)")
+                                    skipped_count += 1
+                                    success = True
+                                    break
+                                elif res.status_code in [502, 503, 504] and attempt < 3:
+                                    time.sleep(attempt * 2)
+                                    continue
+                                else:
+                                    logger.error(f"Failed to create '{new_name}' [{res.status_code}]: {res.text}")
+                                    break
+                            except requests.RequestException as req_err:
+                                if attempt < 3:
+                                    time.sleep(attempt * 2)
+                                    continue
+                                logger.error(f"HTTP request exception for '{new_name}': {req_err}")
 
                     logger.info("============================================================")
                     logger.info("🚀 STAGE 3 COMPLETE: MICROSERVICE RULE REGISTRATION FINISHED")

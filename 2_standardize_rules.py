@@ -255,6 +255,7 @@ def run_standardization():
     csv_rows = []
     active_copied_count = 0
     archived_copied_count = 0
+    failed_writes = 0
     futures = []
 
     with ThreadPoolExecutor(max_workers=16) as executor:
@@ -300,7 +301,11 @@ def run_standardization():
                     csv_rows.append([old_name, new_name])
 
         for future in as_completed(futures):
-            future.result()
+            try:
+                future.result()
+            except Exception as exc:
+                failed_writes += 1
+                logger.error(f"⚠️ Failed to write standardized rule file: {exc}")
 
     for attempt in range(5):
         try:
@@ -323,6 +328,8 @@ def run_standardization():
     logger.info(f"Standardized Archived Rules Written      : {archived_copied_count}")
     logger.info(f"Unified (Active + Deleted) Rows in CSV   : {len(csv_rows)}")
     logger.info(f"Isolated Blueprint CSV Path              : {csv_output_path}")
+    if failed_writes > 0:
+        logger.warning(f"⚠️ Encountered {failed_writes} failed file write tasks.")
     logger.info("============================================================")
 
 

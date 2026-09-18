@@ -170,7 +170,7 @@ def delete_rule_via_api(rule_name: str, deleted_by: str) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Soft delete legacy rules unlinked from active Stage MLS sources.")
-    parser.add_argument("-y", "--force", action="store_true", help="Auto-confirm soft deletion without user prompt.")
+    parser.add_argument("-y", "--yes", "--force", action="store_true", dest="force", help="Auto-confirm soft deletion without user prompt.")
     args = parser.parse_args()
 
     blueprint_file = current_dir / "temp-data" / "migration_blueprint.csv"
@@ -215,7 +215,7 @@ def main() -> None:
 
     if not args.force:
         if not sys.stdin.isatty():
-            logger.warning("⚠️ Non-interactive session detected without --force flag. Aborting for safety.")
+            logger.warning("⚠️ Non-interactive session detected without --yes flag. Aborting for safety.")
             return
 
         confirm = input(f"\nConfirm soft-deletion of {len(rules_to_delete)} unlinked Stage rule(s)? (y/N): ")

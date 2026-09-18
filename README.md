@@ -28,58 +28,63 @@ This project relies on local sibling repositories referenced in `.env.bulk`. Ens
 ## 📦 Installation & Setup
 
 1. **Clone the repository:**
-```bash
-git clone git@github.com:kwri/rules_analytics.git
-cd rules_analytics
-```
+
+   ```bash
+   git clone git@github.com:kwri/rules_analytics.git
+   cd rules_analytics
+   ```
 
 2. **Set up a Virtual Environment:**
 
-Ensure you have Python 3.12 installed before creating your environment to guarantee compatibility with all pre-compiled binary dependencies (such as `psycopg2-binary` and `Django 6.x`).
-```bash
-# Windows (PowerShell / CMD):
-py -3.12 -m venv .venv
+   Ensure you have Python 3.12 installed before creating your environment to guarantee compatibility with pre-compiled binary dependencies.
 
-# macOS / Linux:
-python3.12 -m venv .venv
+   ```bash
+   # Windows (PowerShell / CMD):
+   py -3.12 -m venv .venv
 
-# Activate the environment:
-# Windows (PowerShell):
-.\.venv\Scripts\Activate.ps1
+   # macOS / Linux:
+   python3.12 -m venv .venv
 
-# Windows (Git Bash):
-source .venv/Scripts/activate
+   # Activate the environment:
+   # Windows (PowerShell):
+   .\.venv\Scripts\Activate.ps1
 
-# macOS / Linux:
-source .venv/bin/activate
-```
+   # Windows (Git Bash):
+   source .venv/Scripts/activate
+
+   # macOS / Linux:
+   source .venv/bin/activate
+   ```
 
 3. **Install Dependencies:**
-```bash
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
+
+   ```bash
+   python -m pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
 
 4. **Initialize Google Cloud Application Default Credentials (ADC):**
 
-Stage 9 requires authenticated access to BigQuery (`stream-listing-prod`). Initialize ADC via the PyCharm integrated terminal or PowerShell:
-```powershell
-gcloud auth application-default login
-```
+   Stage 9 requires authenticated access to BigQuery (`stream-listing-prod`). Initialize ADC via terminal:
 
-*Authenticate in the browser using your corporate account (**`<username>@kw.com`**). This generates local credentials at* *`%APPDATA%\gcloud\application_default_credentials.json`**.*
+   ```powershell
+   gcloud auth application-default login
+   ```
+
+   *Authenticate in the browser using your corporate account (`<username>@kw.com`). This generates local credentials at `%APPDATA%\gcloud\application_default_credentials.json`.*
 
 ## ⚙️ Environment Configuration
 
 The pipeline requires two configuration files in the project root: `.env` and `.env.bulk`.
 
-> 📌 **Path Formatting Rule:** All path configurations in `.env` and `.env.bulk` **must use forward slashes (****`/`****)**, even on Windows, to avoid character escaping errors.
+> 📌 **Path Formatting Rule:** All path configurations in `.env` and `.env.bulk` **must use forward slashes (`/`)**, even on Windows, to avoid character escaping errors.
 
 ### `.env`
+
 ```env
 # Database Credentials (Staging & Production Verification)
 DB_NAME=mls_admin
-DB_USER=your_username            # Mandatory: Used for audit trail attribution in API calls (updated_by)
+DB_USER=your_username            # Mandatory: Used for audit trail attribution in API calls (updated_by / created_by)
 DB_PASSWORD=your_password
 DB_HOST=pg-sdk-stage-ext.data.kw.com
 STAGE_DB_HOST=pg-sdk-stage-ext.data.kw.com
@@ -117,6 +122,7 @@ GCP_PROJECT_ID=stream-listing-prod
 ```
 
 ### `.env.bulk`
+
 ```env
 MS_HOST=https://stage-ext-ms.data.kw.com/v1.0.3
 MS_API_KEY=your_mls_admin_api_key
@@ -140,13 +146,15 @@ You can run the migration pipeline either automatically using the master orchest
 #### Interactive Mode
 
 Runs with interactive `(y/N)` confirmation prompts before mutating Staging DB, disabling Production jobs, promoting, and purging temp files:
+
 ```bash
-python run_pipeline.py --limit 1
+python run_pipeline.py --limit 4
 ```
 
 #### Resuming Execution from a Specific Stage
 
 If you pause the pipeline after Stage 5 dry-run inspection or failure recovery, use `--start-at` / `-s` to jump directly to any stage:
+
 ```bash
 # Resume from Stage 6 (Disable Ingestion Jobs) after manual CSV editing in Stage 5:
 python run_pipeline.py --start-at 6
@@ -158,8 +166,9 @@ python run_pipeline.py --start-at 9
 #### Automated / CI Mode
 
 Skips all interactive prompts and automatically sleeps for BigQuery log streaming:
+
 ```bash
-python run_pipeline.py --limit 1 --auto-approve --wait-mins 5
+python run_pipeline.py --limit 4 --auto-approve --wait-mins 5
 ```
 
 #### Command Flags for `run_pipeline.py`
@@ -172,10 +181,11 @@ python run_pipeline.py --limit 1 --auto-approve --wait-mins 5
 ### Method 2: Manual / Sequential Execution
 
 If you need to execute specific stages individually or perform manual parameter inspection:
+
 ```bash
 # Stage 0: Batch Target Selection (API & RETS with live Production status filtering)
-python 0_prepare_batch_targets_api.py --limit 1
-python 0_prepare_batch_targets_rets.py --limit 1
+python 0_prepare_batch_targets_api.py --limit 4
+python 0_prepare_batch_targets_rets.py --limit 4
 
 # Stage 1: Backup Raw DB Records to Local Git Repository
 python 1_sync_database_to_repo.py
@@ -198,7 +208,7 @@ python 5_run_bulk_update.py --input-file temp-data/raw_targeted_rules.csv --do-u
 # Stage 6: Disable Production Ingestion Jobs (Jenkins & API Service)
 python 6_disable_ingestion_jobs.py
 
-# Stage 7: Production Promotion Engine (Remote SDH SSH Runner)
+# Stage 7: Production Promotion Engine (Remote SDH SSH Runner) & Slack Draft
 python 7_run_bulk_promotion.py
 
 # Stage 8: Trigger 3-Day Test Ingestion Reprocessing
@@ -218,54 +228,55 @@ python 11_update_consolidated_repo.py -y
 
 ## 🔍 Parameter Inspection Workflow (Manual Mapping Guard)
 
-When mapping legacy rules to standardized microservice rules where parameter signatures may differ (e.g., `Has Pool` $\rightarrow$ `HasPool`), follow the manual inspection protocol:
+When mapping legacy rules to standardized microservice rules where parameter signatures may differ (e.g., `Has Pool` → `HasPool`), follow the manual inspection protocol:
 
 1. **Run Stage 5 in Dry-Run Mode:**
 
-   PowerShell
-   ```
+   ```bash
    python 5_run_bulk_update.py --input-file temp-data/raw_targeted_rules.csv --debug
-
    ```
+
 2. **Inspect & Adjust CSV:**
 
    Open `temp-data/raw_targeted_rules.csv`. Compare `rule_params` keys against expected microservice parameters (e.g., remapping `features_1` to `features_2`). Save your edits.
+
 3. **Apply Live Update:**
 
-   PowerShell
-   ```
+   ```bash
    python 5_run_bulk_update.py --input-file temp-data/raw_targeted_rules.csv --do-update
-
    ```
+
 4. **Resume Automated Pipeline:**
 
-   PowerShell
-   ```
+   ```bash
    python run_pipeline.py --start-at 6
-
    ```
 
 ## 📋 Script Execution Sequence Reference
 
-- **`0_prepare_batch_targets_api.py`** **&** **`0_prepare_batch_targets_rets.py`**: Queries unmigrated legacy rules and builds batch target CSVs in `temp-data/`.
-- **`1_sync_database_to_repo.py`**: Connects via SSH to back up raw DB rule records to disk.
-- **`2_standardize_rules.py`**: Transforms names to `PascalCase`, resolves versioning collisions (V1/V2), and generates `migration_blueprint.csv`.
+- **`0_prepare_batch_targets_api.py`** **&** **`0_prepare_batch_targets_rets.py`**: Queries unmigrated legacy rules, executes reverse promotion (Prod → Stage) for selected targets, and builds batch CSVs in `temp-data/`.
+- **`1_sync_database_to_repo.py`**: Connects via SSH to back up raw DB rule records concurrently to local repository disk storage (`ui-rules/active` and `ui-rules/archived`).
+- **`2_standardize_rules.py`**: Transforms rule names to `PascalCase`, resolves versioning collisions (`V1`/`V2`), and outputs `migration_blueprint.csv`.
 - **`3_inserting_new_rule.py`**: Registers newly standardized rules in Staging via `POST /v1/mls-admin/rules`.
-- **`4_generate_targeted_csv.py`**: Traverses JSON property maps, correlates targets, and generates `raw_targeted_rules.csv`. Handles no-op MLS fast-forwarding directly to `processed_mls_ledger.json`.
+- **`4_generate_targeted_csv.py`**: Traverses JSON property maps, correlates targets, and generates `raw_targeted_rules.csv` and `promotion_sources.txt`. Fast-forwards no-op batches directly to `processed_mls_ledger.json`.
 - **`5_run_bulk_update.py`**: Applies bulk schema updates directly to the Staging database via microservice API handoff (`bulk_map_tool`).
-- **`6_disable_ingestion_jobs.py`**: Disables Production Jenkins jobs (RETS) and API ingestion schedules (passing `DB_USER` for audit attribution).
-- **`7_run_bulk_promotion.py`**: Uploads deployment manifests via SFTP to `sdh.data.kw.com` and executes remote promotion (`s_p`).
-- **`8_trigger_manual_downloads.py`**: Enables required ingestion schedules and triggers parallel 3-day reprocessing ranges in Production.
-- **`9_verify_and_enable_injestion_jobs_api.py`**: Queries BigQuery landing tables (`mls_download`) via ADC by `batch_id`, validates download row counts, and restores schedules for clean MLS targets.
-- **`10_soft_delete_legacy_rules.py`**: Checks if legacy rules are used by unmigrated MLSs, soft-deleting only fully unlinked rules via API.
+- **`6_disable_ingestion_jobs.py`**: Disables Production Jenkins jobs (RETS) and API ingestion schedules, filtering strictly against `promotion_sources.txt`.
+- **`7_run_bulk_promotion.py`**: Generates a formatted Slack notification draft (copied to clipboard), uploads deployment manifests via SFTP to `sdh.data.kw.com`, and executes remote promotion (`s_p`).
+- **`8_trigger_manual_downloads.py`**: Enables required ingestion schedules and triggers parallel 3-day reprocessing ranges in Production for promoted MLS sources.
+- **`9_verify_and_enable_injestion_jobs_api.py`**: Queries BigQuery landing tables (`mls_download.*`) via ADC by `batch_id`, validates row counts, and restores schedules for clean MLS targets.
+- **`10_soft_delete_legacy_rules.py`**: Checks if legacy rules are still used by unmigrated MLSs, soft-deleting only fully unlinked rules via Stage API.
 - **`11_update_consolidated_repo.py`**: Moves soft-deleted rules to `archived/`, records completed sources in `processed_mls_ledger.json`, purges old logs (>3 days), and cleans `temp-data/`.
 
 ## 📂 Key State Files in `temp-data/`
 
 - **`processed_mls_ledger.json`**: Permanent ledger tracking all fully migrated and audited MLS IDs. Stage 0 reads this file to ensure completed MLS sources are never re-processed.
 - **`skip_mls.txt`**: Numerically sorted manual exclusion list for inactive or restricted MLS sources (`mls_status_id != 2`).
+- **`promotion_sources.txt`**: Manifest containing numeric MLS IDs that contain active mutations for forward promotion.
 - **`raw_targeted_rules.csv`**: Specific rule mutations generated in Stage 4 for Stage 5 input.
 - **`triggered_downloads_log_api.csv`**: Operational log generated in Stage 8 storing `batch_id` values used by BigQuery queries in Stage 9.
 
 ## 🛡️ Safety Protocols & Troubleshooting
-Refer https://kwri.atlassian.net/wiki/spaces/ProdOps/pages/3225518104/Errors+regarding+Rules+Cleanup+Project
+
+Refer to the official internal operational documentation for troubleshooting common connection timeouts or microservice key issues:
+
+- [ProdOps Rules Cleanup Project Guide](https://kwri.atlassian.net/wiki/spaces/ProdOps/pages/3225518104/Errors%2Bregarding%2BRules%2BCleanup%2BProject)

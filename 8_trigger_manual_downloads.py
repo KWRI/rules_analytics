@@ -2,7 +2,8 @@
 Pipeline Stage 8: Multi-Protocol Ingestion Job Enabler & Trigger Engine (Parallelized & Robust).
 
 Parses target batch files ('temp-data/batch_mls_targets_rets.csv', 'temp-data/batch_mls_targets_api.csv',
-or 'temp-data/batch_mls_targets.csv') and triggers ingestion downloads in parallel:
+or 'temp-data/batch_mls_targets.csv') AND filters strictly against 'temp-data/promotion_sources.txt'.
+Triggers ingestion downloads in parallel ONLY for promoted sources:
   - RETS Integration: Enables Jenkins jobs, triggers 'buildWithParameters' (LOAD_TYPE=incr),
                       and polls execution status until completion concurrently.
   - API Integration: Triggers 3-day manual reprocess downloads via Production Microservice API,
@@ -32,37 +33,29 @@ logger = setup_logger("Stage8_TriggerDownload")
 # ==============================================================================
 # ENVIRONMENT CONSTANTS
 # ==============================================================================
-# Jenkins Config (RETS)
 JENKINS_URL = os.getenv("JENKINS_PROD_URL", "").strip().strip("'\"")
 JENKINS_USER = os.getenv("JENKINS_USER", "").strip().strip("'\"")
 JENKINS_TOKEN = os.getenv("JENKINS_PROD_TOKEN", "").strip().strip("'\"")
 
-# API Microservice Config (API Production)
 MLS_ADMIN_PROD_URL = os.getenv("MLS_ADMIN_PROD_URL", "").strip().strip("'\"").rstrip("/")
 PROD_BASE_URL = MLS_ADMIN_PROD_URL.split("/v1/mls-admin")[0] if "/v1/mls-admin" in MLS_ADMIN_PROD_URL else MLS_ADMIN_PROD_URL
 
 API_KEY = os.getenv("MLS_ADMIN_API_KEY") or os.getenv("API_KEY", "")
 
-# Jenkins Polling Config
 POLL_INTERVAL_SEC = 15
 MAX_WAIT_MINUTES = 10
-MAX_PARALLEL_WORKERS = 8  # Parallel threads for concurrent triggers
+MAX_PARALLEL_WORKERS = 8
 
-# API Download Defaults
 DEFAULT_RELATIVE_PERIOD = "3"
 DEFAULT_RELATIVE_PERIOD_UNIT = "day"
 
-
-# ==============================================================================
-# ROBUST NETWORK SESSION BUILDER
-# ==============================================================================
 
 def create_robust_session() -> requests.Session:
     """Creates a requests session configured with automatic retries for dropped connections."""
     session = requests.Session()
     retries = Retry(
-        total=3,  # Max 3 retries for connection blips
-        backoff_factor=2,  # Waits 2s, 4s, 8s between attempts
+        total=3,
+        backoff_factor=2,
         status_forcelist=[500, 502, 503, 504],
         raise_on_status=False
     )
@@ -70,6 +63,19 @@ def create_robust_session() -> requests.Session:
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
+
+
+def load_promoted_mls_ids(manifest_path: Path) -> set[int]:
+    """Reads unique numeric MLS IDs strictly from promotion_sources.txt."""
+    if not manifest_path.exists():
+        logger.warning(f"⚠️ Promotion manifest not found at '{manifest_path}'. No downloads will be triggered.")
+        return set()
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        promoted_ids = {int(line.strip()) for line in f if line.strip().isdigit()}
+
+    logger.info(f"🎯 Loaded {len(promoted_ids)} promoted MLS ID(s) from 'promotion_sources.txt': {sorted(list(promoted_ids))}")
+    return promoted_ids
 
 
 # ==============================================================================
@@ -119,7 +125,7 @@ def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, he
 
     if queue_url:
         logger.info(f"⏳ Waiting for build '{job_name}' to start in queue...")
-        for _ in range(12):  # Wait up to 60s for build assignment
+        for _ in range(12):
             time.sleep(5)
             try:
                 q_res = session.get(f"{queue_url.rstrip('/')}/api/json", timeout=10)
@@ -132,7 +138,6 @@ def trigger_and_monitor_jenkins_job(session: requests.Session, job_name: str, he
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as err:
                 logger.warning(f"⚠️ Connection glitch polling queue for '{job_name}' (retrying): {err}")
 
-    # Fallback: query job API directly if queue resolution timed out
     if not build_number:
         try:
             last_build_res = session.get(f"{base_url}/job/{job_name}/api/json", timeout=10)
@@ -272,7 +277,6 @@ def trigger_api_download(session: requests.Session, mls_id: int, mls_id_str: str
             if response.status_code in (200, 201, 202):
                 data = response.json() if response.text else {}
 
-                # FORCE STRICT STRING CASTING TO PREVENT 64-BIT INT FLOAT ROUNDING
                 raw_batch_id = data.get("batch_id")
                 batch_id = str(raw_batch_id).strip() if raw_batch_id is not None else ""
 
@@ -407,6 +411,15 @@ def main():
     logger.info("============================================================")
 
     temp_data_dir = current_dir / "temp-data"
+    manifest_path = temp_data_dir / "promotion_sources.txt"
+
+    # 1. Load promoted MLS IDs strictly from promotion_sources.txt
+    promoted_mls_ids = load_promoted_mls_ids(manifest_path)
+
+    if not promoted_mls_ids:
+        logger.info("🎉 No promoted MLS sources found in promotion_sources.txt (no-op batch). Skipping Stage 8 download triggers.")
+        return
+
     target_csv_files = [
         temp_data_dir / "batch_mls_targets_rets.csv",
         temp_data_dir / "batch_mls_targets_api.csv",
@@ -416,6 +429,7 @@ def main():
     rets_targets = set()
     api_targets_dict = {}
 
+    # 2. Filter batch targets STRICTLY against promoted_mls_ids
     for csv_path in target_csv_files:
         if not csv_path.exists():
             continue
@@ -427,30 +441,34 @@ def main():
                 mls_id_str = row.get("mls_id_str", "").strip()
                 protocol = row.get("download_protocol", "").strip().lower()
 
-                if not mls_id_raw or not mls_id_str:
+                if not mls_id_raw or not mls_id_str or not mls_id_raw.isdigit():
+                    continue
+
+                mls_id = int(mls_id_raw)
+
+                # STRICT GUARD: Only process if mls_id is in promotion_sources.txt
+                if mls_id not in promoted_mls_ids:
                     continue
 
                 if "rets" in protocol or "rets" in csv_path.name:
-                    rets_targets.add((mls_id_raw, mls_id_str))
+                    rets_targets.add((mls_id, mls_id_str))
                 elif any(p in protocol for p in ["api", "rest", "oauth"]) or "api" in csv_path.name:
-                    if mls_id_raw.isdigit():
-                        mls_id = int(mls_id_raw)
-                        content_type = row.get("content_type", "").strip()
-                        content_sub_type = row.get("content_sub_type", "").strip()
-                        key = (mls_id, content_type, content_sub_type)
+                    content_type = row.get("content_type", "").strip()
+                    content_sub_type = row.get("content_sub_type", "").strip()
+                    key = (mls_id, content_type, content_sub_type)
 
-                        if key not in api_targets_dict:
-                            api_targets_dict[key] = {
-                                "mls_id": mls_id,
-                                "mls_id_str": mls_id_str,
-                                "content_type": content_type,
-                                "content_sub_type": content_sub_type,
-                            }
+                    if key not in api_targets_dict:
+                        api_targets_dict[key] = {
+                            "mls_id": mls_id,
+                            "mls_id_str": mls_id_str,
+                            "content_type": content_type,
+                            "content_sub_type": content_sub_type,
+                        }
 
     api_targets = list(api_targets_dict.values())
 
-    logger.info(f"RETS Target Feeds Discovered : {len(rets_targets)}")
-    logger.info(f"API Target Feeds Discovered  : {len(api_targets)}")
+    logger.info(f"Promoted RETS Target Feeds Discovered : {len(rets_targets)}")
+    logger.info(f"Promoted API Target Feeds Discovered  : {len(api_targets)}")
     logger.info("============================================================")
 
     if rets_targets:
@@ -460,7 +478,7 @@ def main():
         process_api_triggers_parallel(api_targets)
 
     if not rets_targets and not api_targets:
-        logger.warning("No RETS or API targets discovered in batch CSVs. No downloads were triggered.")
+        logger.warning("No matching promoted RETS or API targets discovered in batch CSVs. No downloads were triggered.")
 
 
 if __name__ == "__main__":

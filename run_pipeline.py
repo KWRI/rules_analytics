@@ -4,12 +4,19 @@ Master Migration Pipeline Orchestrator.
 Sequentially executes Stages 0 through 11 with built-in error handling,
 dry-run verification gates, timing pause prompts, and user confirmation steps.
 
-Usage:
-    python run_pipeline.py                               # Interactive mode (default batch limit: 4)
-    python run_pipeline.py --limit 2                    # Custom batch limit (2 MLSs per variant)
-    python run_pipeline.py --start-at 6                  # Resume pipeline execution directly from Stage 6
-    python run_pipeline.py --auto-approve                # CI/CD Headless mode
-    python run_pipeline.py --auto-approve --wait-mins 5 # Headless mode with 5-minute BigQuery wait gate
+Pipeline Flow:
+    Stage 0   : Target Selection & Reverse Promotion (API & RETS -> Prod to Stage Sync)
+    Stage 1   : Core Database Ingress Backup
+    Stage 2   : Rule Standardization & Blueprint Compilation
+    Stage 3   : Microservice Rule Registration
+    Stage 4   : Targeted Mutation CSV & Manifest Generation
+    Stage 5   : Staging Bulk Update
+    Stage 6   : Disable Ingestion Jobs
+    Stage 7   : Draft Slack Notification & Production Promotion
+    Stage 8   : Re-enable Jobs & Trigger Manual Downloads
+    Stage 9   : Verify Ingestion & Re-enable API Jobs
+    Stage 10  : Safe Soft Delete Legacy Rules
+    Stage 11  : Repository Archival & Ledger Update
 """
 
 import sys
@@ -71,7 +78,7 @@ def main() -> None:
     parser.add_argument(
         "--auto-approve",
         action="store_true",
-        help="Skip interactive prompts"
+        help="Skip interactive prompts for non-interactive execution"
     )
     parser.add_argument(
         "--wait-mins",
@@ -93,14 +100,21 @@ def main() -> None:
     # STAGE 0: Prepare Batch Targets (API & RETS)
     # ------------------------------------------------------------
     if start_at <= 0:
-        run_stage("0_prepare_batch_targets_api.py", ["--limit", str(args.limit)])
-        run_stage("0_prepare_batch_targets_rets.py", ["--limit", str(args.limit)])
+        stage0_args = ["--limit", str(args.limit)]
+        if args.auto_approve:
+            stage0_args.append("-y")
+
+        if not run_stage("0_prepare_batch_targets_api.py", stage0_args):
+            sys.exit(1)
+
+        if not run_stage("0_prepare_batch_targets_rets.py", stage0_args):
+            sys.exit(1)
 
         api_batch = Path("temp-data/batch_mls_targets_api.csv")
         rets_batch = Path("temp-data/batch_mls_targets_rets.csv")
 
         if (not api_batch.exists() or not api_batch.read_text().strip()) and \
-           (not rets_batch.exists() or not rets_batch.read_text().strip()):
+                (not rets_batch.exists() or not rets_batch.read_text().strip()):
             logger.info("🎉 No unmigrated rules/MLSs remaining! Pipeline finished early.")
             sys.exit(0)
 
@@ -123,12 +137,11 @@ def main() -> None:
         if not run_stage("4_generate_targeted_csv.py"):
             sys.exit(1)
 
-        # Check if raw_targeted_rules.csv actually has pending mutation rows
         targeted_csv = Path("temp-data/raw_targeted_rules.csv")
         has_mutations = False
         if targeted_csv.exists():
             lines = [line.strip() for line in targeted_csv.read_text(encoding="utf-8").splitlines() if line.strip()]
-            if len(lines) > 1:  # More than header row
+            if len(lines) > 1:
                 has_mutations = True
 
         if not has_mutations:
@@ -158,7 +171,8 @@ def main() -> None:
     # ------------------------------------------------------------
     if start_at <= 6:
         if not args.auto_approve and start_at < 6:
-            if not prompt_user_confirmation("Stage 5 complete. Do you want to proceed with DISABLING Production Ingestion Jobs (Stage 6)?"):
+            if not prompt_user_confirmation(
+                    "Stage 5 complete. Do you want to proceed with DISABLING Production Ingestion Jobs (Stage 6)?"):
                 logger.warning("Pipeline paused by user prior to disabling Production jobs.")
                 sys.exit(0)
 
@@ -166,21 +180,28 @@ def main() -> None:
             sys.exit(1)
 
     # ------------------------------------------------------------
-    # STAGE 7: Production Environment Bulk Promotion
+    # STAGE 7: Production Environment Bulk Promotion & Slack Draft
     # ------------------------------------------------------------
     if start_at <= 7:
-        if not args.auto_approve:
-            if not prompt_user_confirmation("Production jobs disabled. Do you want to proceed with PRODUCTION PROMOTION (Stage 7)?"):
+        if not args.auto_approve and start_at < 7:
+            if not prompt_user_confirmation(
+                    "Production jobs disabled. Do you want to proceed with PRODUCTION PROMOTION & Slack Draft (Stage 7)?"):
                 logger.warning("Pipeline paused by user prior to Production promotion.")
                 sys.exit(0)
 
-        if not run_stage("7_run_bulk_promotion.py"):
+        stage7_args = ["-y"] if args.auto_approve else []
+        if not run_stage("7_run_bulk_promotion.py", stage7_args):
             sys.exit(1)
 
     # ------------------------------------------------------------
     # STAGE 8: Re-Enable Jobs & Trigger Downloads
     # ------------------------------------------------------------
     if start_at <= 8:
+        if not args.auto_approve:
+            if not prompt_user_confirmation("Stage 7 Forward Promotion complete. Ready to RE-ENABLE Production Ingestion Jobs & Trigger Downloads (Stage 8)?"):
+                logger.warning("Pipeline paused by user prior to Stage 8 manual download trigger.")
+                sys.exit(0)
+
         if not run_stage("8_trigger_manual_downloads.py"):
             sys.exit(1)
 
@@ -200,7 +221,8 @@ def main() -> None:
 
             logger.info("✅ Wait complete. Proceeding to Stage 9 log verification.")
         else:
-            if not prompt_user_confirmation(f"Have you allowed ~{args.wait_mins} minutes for downloads to complete? Ready to verify BigQuery logs (Stage 9)?"):
+            if not prompt_user_confirmation(
+                    f"Have you allowed ~{args.wait_mins} minutes for downloads to complete? Ready to verify BigQuery logs (Stage 9)?"):
                 logger.warning("Pipeline paused by user prior to Stage 9 log verification.")
                 logger.info("💡 You can manually run 'python run_pipeline.py --start-at 9' when ready.")
                 sys.exit(0)

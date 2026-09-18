@@ -5,19 +5,25 @@ Targets ONLY API MLS sources that are active in both Staging and Production.
 Intersects real-time Production active state (mls_status_id = 2) with Staging candidate rules.
 Excludes completed ledger IDs and manual exclusions in skip_mls.txt.
 
-Generates 'api_mls.txt', 'api_rules.txt', and 'batch_mls_targets_api.csv', then merges into 'batch_mls_targets.csv'.
+Workflow:
+1. Queries Staging DB to select target MLS IDs UP TO `--limit`.
+2. Writes target IDs to 'temp-data/reverse_promotion_sources.txt'.
+3. Displays sources and asks operator for explicit confirmation before reverse promotion.
+4. Invokes 'reverse_promotion_prod_to_stage.py' ONLY for confirmed target IDs.
+5. Fetches metadata and generates 'api_mls.txt', 'api_rules.txt', and 'batch_mls_targets_api.csv'.
 
 Usage:
     python 0_prepare_batch_targets_api.py           # Uses default limit (5 MLSs)
-    python 0_prepare_batch_targets_api.py --limit 2 # Picks targets across 2 distinct MLSs
-    python 0_prepare_batch_targets_api.py -l 10     # Picks targets across 10 distinct MLSs
+    python 0_prepare_batch_targets_api.py --limit 1 # Picks targets across 1 distinct MLS
 """
 
 import os
 import io
 import re
 import csv
+import sys
 import argparse
+import subprocess
 import warnings
 from pathlib import Path
 import psycopg2
@@ -49,6 +55,12 @@ def is_pascal_case(name: str) -> bool:
     if not name or re.match(r'^\d', name) or any(c in name for c in ('_', ' ', '-', '/')):
         return False
     return bool(re.match(r'^[A-Z][a-zA-Z0-9]*$', name))
+
+
+def prompt_user_confirmation(prompt_text: str) -> bool:
+    """Prompts the operator for explicit Y/N confirmation."""
+    answer = input(f"\n⚠️  {prompt_text} (y/N): ").strip().lower()
+    return answer == "y"
 
 
 def save_unified_working_targets(current_records: list[dict]):
@@ -92,7 +104,7 @@ def save_unified_working_targets(current_records: list[dict]):
         writer.writerows(sorted_records)
 
 
-def generate_batch(mls_limit: int):
+def generate_batch(mls_limit: int, auto_approve: bool = False):
     stage_ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
     ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
     ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
@@ -103,13 +115,13 @@ def generate_batch(mls_limit: int):
     db_user = (os.getenv("DB_USER", "")).strip("'\"")
     db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
 
-    # 1. Fetch live active Production MLS IDs (Dynamic check)
+    # 1. Fetch live active Production MLS IDs
     active_prod_mls = get_live_active_prod_mls(logger=logger)
     if not active_prod_mls:
         logger.error("❌ No active MLS sources returned from Production DB. Aborting target generation.")
         return
 
-    # 2. Load static exclusions (Ledger + Manual skip_mls.txt)
+    # 2. Load exclusions
     already_processed_mls = load_processed_ledger(TEMP_DATA_DIR)
     manual_skip_mls = load_skip_mls(TEMP_DATA_DIR)
 
@@ -117,7 +129,6 @@ def generate_batch(mls_limit: int):
     if manual_skip_mls:
         logger.info(f"Loaded {len(manual_skip_mls)} manual exclusion ID(s) from skip_mls.txt.")
 
-    # Exclusions to pass into SQL query
     excluded_mls_list = list(already_processed_mls.union(manual_skip_mls))
     allowed_prod_mls_list = list(active_prod_mls)
 
@@ -197,7 +208,60 @@ def generate_batch(mls_limit: int):
                     target_mls_list = sorted(list(selected_mls_set))
                     logger.info(f"Selected target Production-Verified API MLS IDs ({len(target_mls_list)}): {target_mls_list}")
 
-                    logger.info("Step 2: Fetching granular metadata for target API MLS sources...")
+        # 3. Write reverse_promotion_sources.txt
+        TEMP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        rev_manifest_path = TEMP_DATA_DIR / "reverse_promotion_sources.txt"
+        rev_manifest_path.write_text(
+            "\n".join(str(m) for m in target_mls_list) + "\n",
+            encoding="utf-8"
+        )
+
+        # Read manifest file to ensure 100% accuracy in display
+        rev_sources = [
+            int(line.strip())
+            for line in rev_manifest_path.read_text(encoding="utf-8").splitlines()
+            if line.strip().isdigit()
+        ]
+
+        # 4. Mandatory Interactive Confirmation Gate before Reverse Promotion
+        logger.info("============================================================")
+        logger.info(f"📄 Target Reverse Promotion Manifest written: {rev_manifest_path}")
+        logger.info(f"🎯 Target Sources Loaded from File ({len(rev_sources)}): {rev_sources}")
+        logger.info("============================================================")
+
+        if not auto_approve:
+            prompt_msg = f"Ready to promote the following sources from 'reverse_promotion_sources.txt' (PROD -> STAGE)?\n   Sources: {rev_sources}"
+            if not prompt_user_confirmation(prompt_msg):
+                logger.warning("Reverse promotion aborted by operator. Stopping Stage 0 API target generation.")
+                sys.exit(0)
+
+        # 5. Trigger Reverse Promotion
+        logger.info("🚀 Triggering Reverse Promotion (Prod -> Stage) for target batch...")
+        rev_cmd = [sys.executable, "reverse_promotion_prod_to_stage.py"]
+        if auto_approve:
+            rev_cmd.append("-y")
+
+        rev_result = subprocess.run(rev_cmd)
+        if rev_result.returncode != 0:
+            logger.error("❌ Reverse promotion failed! Aborting API target generation.")
+            return
+
+        # 6. Fetch granular metadata after reverse promotion
+        logger.info("Step 2: Fetching granular metadata for target API MLS sources...")
+        with SSHTunnelForwarder(
+                (stage_ssh_host, 22),
+                ssh_username=ssh_user,
+                ssh_pkey=mypkey,
+                remote_bind_address=(stage_db_host, 5432),
+        ) as tunnel:
+            with psycopg2.connect(
+                    dbname=db_name,
+                    user=db_user,
+                    password=db_pass,
+                    host="127.0.0.1",
+                    port=tunnel.local_bind_port,
+            ) as conn:
+                with conn.cursor() as cur:
                     query_2 = """
                         SELECT DISTINCT
                             pr.name AS legacy_rule_name,
@@ -258,8 +322,6 @@ def generate_batch(mls_limit: int):
         )
         final_sorted_rules = sorted(list(target_rules_set))
 
-        TEMP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
         api_mls_path = TEMP_DATA_DIR / "api_mls.txt"
         api_rules_path = TEMP_DATA_DIR / "api_rules.txt"
         api_targets_csv_path = TEMP_DATA_DIR / "batch_mls_targets_api.csv"
@@ -303,6 +365,12 @@ if __name__ == "__main__":
         default=DEFAULT_BATCH_MLS_LIMIT,
         help=f"Number of API MLS sources to process in this batch (default: {DEFAULT_BATCH_MLS_LIMIT})"
     )
+    parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        dest="auto_approve",
+        help="Auto-approve interactive prompts"
+    )
     args = parser.parse_args()
 
-    generate_batch(mls_limit=args.limit)
+    generate_batch(mls_limit=args.limit, auto_approve=args.auto_approve)

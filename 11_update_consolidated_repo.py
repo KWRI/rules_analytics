@@ -241,7 +241,7 @@ def cleanup_old_logs(logs_dir: Path, keep_days: int = 3) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Archive soft-deleted rules and update processed ledger.")
-    parser.add_argument("-y", "--clean-temp", action="store_true", help="Automatically clean temporary working files without prompt.")
+    parser.add_argument("-y", "--yes", "--clean-temp", action="store_true", dest="clean_temp", help="Automatically clean temporary working files without prompt.")
     args = parser.parse_args()
 
     temp_dir = current_dir / "temp-data"
