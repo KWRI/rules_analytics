@@ -13,6 +13,7 @@ API Specification:
 import os
 import io
 import sys
+import signal
 import argparse
 import requests
 import pandas as pd
@@ -22,6 +23,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.hazmat.primitives import serialization
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
 
 from pipeline_logger import setup_logger
 

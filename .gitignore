@@ -1,8 +1,9 @@
 # Ignore pipeline output manifest spreadsheets and transient directories
 *.csv
 standard-rule-names/temp-data/
-temp-data/
-promotion_sources.txt
+temp-data/*
+!temp-data/processed_mls_ledger.json
+!discrepant_mls.txt
 
 # Virtual Environments
 .venv/

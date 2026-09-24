@@ -1,239 +1,207 @@
 """
-Pipeline Utilities Module.
+Pipeline Utility Toolkit.
 
-Provides shared configuration loaders, target file parsers, ledger trackers,
-manual skip list managers, and real-time Production DB status verification.
+Provides reusable database helper functions to query central ledger locking status
+(`public.processed_mls_ledger`), claim target MLS batches, finalize status, and load local target rules.
 """
 
 import os
-import io
 import json
-from pathlib import Path
+import csv
 import psycopg2
-import paramiko
-from sshtunnel import SSHTunnelForwarder
-from cryptography.hazmat.primitives import serialization
-from dotenv import load_dotenv
+from pathlib import Path
 
-# Force load .env from the project root directory
-current_dir = Path(__file__).resolve().parent
-load_dotenv(dotenv_path=current_dir / ".env")
-
-
-def load_target_rules(temp_data_dir: Path) -> set[str]:
-    """
-    Reads rule names from 'api_rules.txt' and 'rets_rules.txt' inside temp-data/.
-    Returns a unified set of rule names. Safely skips missing files or commented lines.
-    """
-    target_rules = set()
-    candidate_files = [
-        temp_data_dir / "api_rules.txt",
-        temp_data_dir / "rets_rules.txt",
-    ]
-
-    for rule_file in candidate_files:
-        if rule_file.exists():
-            lines = rule_file.read_text(encoding="utf-8").splitlines()
-            for line in lines:
-                cleaned = line.strip().strip("'\"")
-                if cleaned and not cleaned.startswith("#"):
-                    target_rules.add(cleaned)
-
-    return target_rules
+DEFAULT_USER = (
+    os.getenv("DB_USER") or
+    os.getenv("USERNAME") or
+    os.getenv("USER") or
+    "migration_pipeline_bot"
+).strip().strip("'\"")
 
 
-def load_target_mls(temp_data_dir: Path) -> set[int]:
-    """
-    Reads numeric MLS IDs from 'api_mls.txt' and 'rets_mls.txt' inside temp-data/.
-    Returns a unified set of integer MLS IDs (e.g., {189, 533}).
-    Safely skips missing files, non-numeric values, or commented lines.
-    """
-    target_ids = set()
-    candidate_files = [
-        temp_data_dir / "api_mls.txt",
-        temp_data_dir / "rets_mls.txt",
-    ]
+def load_discrepant_mls(root_dir: Path) -> set[int]:
+    """Reads unique integer MLS IDs from root-level discrepant_mls.txt file."""
+    discrepant_file = root_dir / "discrepant_mls.txt"
+    discrepant_ids = set()
 
-    for mls_file in candidate_files:
-        if mls_file.exists():
-            lines = mls_file.read_text(encoding="utf-8").splitlines()
-            for line in lines:
-                cleaned = line.strip().strip("'\"")
-                if cleaned and not cleaned.startswith("#"):
-                    try:
-                        target_ids.add(int(cleaned))
-                    except ValueError:
-                        print(f"⚠️ Warning: Skipping non-numeric MLS ID '{cleaned}' in {mls_file.name}")
+    if not discrepant_file.exists():
+        return discrepant_ids
 
-    return target_ids
+    try:
+        with open(discrepant_file, mode="r", encoding="utf-8") as f:
+            for line in f:
+                cleaned = line.split("#")[0].strip().strip("'\"")
+                if cleaned.isdigit():
+                    discrepant_ids.add(int(cleaned))
+    except Exception:
+        pass
+
+    return discrepant_ids
 
 
 def load_processed_ledger(temp_data_dir: Path) -> set[int]:
-    """
-    Reads previously processed MLS IDs from 'processed_mls_ledger.json' inside temp-data/.
-    Returns a set of integer MLS IDs.
-    """
+    """Loads all completed integer MLS primary key IDs from processed_mls_ledger.json."""
     ledger_file = temp_data_dir / "processed_mls_ledger.json"
-    if not ledger_file.exists():
-        return set()
+    completed_mls = set()
 
+    if ledger_file.exists():
+        try:
+            data = json.loads(ledger_file.read_text(encoding="utf-8"))
+            completed_mls = set(int(x) for x in data.get("completed_mls_ids", []))
+        except Exception:
+            pass
+
+    return completed_mls
+
+
+def get_db_locked_mls_ids(conn) -> set[int]:
+    """Queries public.processed_mls_ledger to return MLS primary key IDs currently marked IN_PROGRESS or COMPLETED."""
+    locked_ids = set()
+    query = """
+        SELECT mls_id 
+        FROM public.processed_mls_ledger 
+        WHERE status IN ('IN_PROGRESS', 'COMPLETED');
+    """
     try:
-        data = json.loads(ledger_file.read_text(encoding="utf-8"))
-        return set(int(x) for x in data.get("completed_mls_ids", []))
+        with conn.cursor() as cur:
+            cur.execute(query)
+            for (m_id,) in cur.fetchall():
+                if m_id is not None:
+                    locked_ids.add(int(m_id))
     except Exception:
-        return set()
+        conn.rollback()
+
+    return locked_ids
 
 
-def sort_and_format_skip_file(skip_file: Path) -> None:
-    """
-    Cleans, sorts in ascending order by MLS ID, and overwrites skip_mls.txt.
-    Eliminates leading blank lines and duplicate entries while preserving comments.
-    """
-    if not skip_file.exists():
+def claim_mls_batch_in_db(conn, mls_targets: list[tuple[int, str]] | list[int], current_user: str = DEFAULT_USER) -> None:
+    """Locks a batch of MLS targets as 'IN_PROGRESS' in public.processed_mls_ledger."""
+    if not mls_targets:
         return
 
-    entries = {}
-    lines = skip_file.read_text(encoding="utf-8").splitlines()
-
-    for line in lines:
-        raw_line = line.strip()
-        if not raw_line or raw_line.startswith("#"):
-            continue
-
-        parts = raw_line.split("#", 1)
-        mls_str = parts[0].strip()
-        comment = parts[1].strip() if len(parts) > 1 else ""
-
-        if mls_str.isdigit():
-            mls_id = int(mls_str)
-            if mls_id in entries:
-                if comment and comment not in entries[mls_id]:
-                    entries[mls_id] = f"{entries[mls_id]}; {comment}" if entries[mls_id] else comment
-            else:
-                entries[mls_id] = comment
-
-    if not entries:
-        return
-
-    sorted_lines = []
-    for mls_id in sorted(entries.keys()):
-        comment = entries[mls_id]
-        if comment:
-            sorted_lines.append(f"{mls_id}  # {comment}")
+    normalized_targets = []
+    for item in mls_targets:
+        if isinstance(item, tuple):
+            normalized_targets.append((int(item[0]), str(item[1])))
         else:
-            sorted_lines.append(f"{mls_id}")
+            normalized_targets.append((int(item), str(item)))
 
-    formatted_content = "\n".join(sorted_lines) + "\n"
-    skip_file.write_text(formatted_content, encoding="utf-8")
+    query = """
+        INSERT INTO public.processed_mls_ledger (mls_id, mls_id_str, status, created_by, updated_by, created_at, updated_at)
+        VALUES (%s, %s, 'IN_PROGRESS', %s, %s, NOW(), NOW())
+        ON CONFLICT (mls_id) 
+        DO UPDATE SET status = 'IN_PROGRESS', mls_id_str = EXCLUDED.mls_id_str, updated_by = EXCLUDED.updated_by, updated_at = NOW();
+    """
+    try:
+        with conn.cursor() as cur:
+            for m_id, m_id_str in normalized_targets:
+                cur.execute(query, (m_id, m_id_str, current_user, current_user))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
+
+
+def finalize_mls_batch_in_db(conn, mls_targets: list[tuple[int, str]] | list[int], current_user: str = DEFAULT_USER) -> None:
+    """Finalizes target MLS primary key IDs as 'COMPLETED' in public.processed_mls_ledger."""
+    if not mls_targets:
+        return
+
+    normalized_targets = []
+    for item in mls_targets:
+        if isinstance(item, tuple):
+            normalized_targets.append((int(item[0]), str(item[1])))
+        else:
+            normalized_targets.append((int(item), str(item)))
+
+    query = """
+        INSERT INTO public.processed_mls_ledger (mls_id, mls_id_str, status, created_by, updated_by, created_at, updated_at)
+        VALUES (%s, %s, 'COMPLETED', %s, %s, NOW(), NOW())
+        ON CONFLICT (mls_id) 
+        DO UPDATE SET status = 'COMPLETED', mls_id_str = EXCLUDED.mls_id_str, updated_by = EXCLUDED.updated_by, updated_at = NOW();
+    """
+    try:
+        with conn.cursor() as cur:
+            for m_id, m_id_str in normalized_targets:
+                cur.execute(query, (m_id, m_id_str, current_user, current_user))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise e
 
 
 def load_skip_mls(temp_data_dir: Path) -> set[int]:
-    """
-    Checks for 'skip_mls.txt' across temp-data/, root project, or script directory.
-    Merges entries across all locations and formats files in-place.
-    """
-    candidates = [
-        temp_data_dir / "skip_mls.txt",
-        temp_data_dir.parent / "skip_mls.txt",
-        Path(__file__).resolve().parent / "skip_mls.txt"
-    ]
-
+    """Reads unique integer MLS primary key IDs from skip_mls.txt if present."""
+    skip_file = temp_data_dir / "skip_mls.txt"
     skip_ids = set()
-    for skip_file in candidates:
-        if skip_file.exists():
-            sort_and_format_skip_file(skip_file)
 
-            for line in skip_file.read_text(encoding="utf-8").splitlines():
-                cleaned = line.split("#")[0].strip()
+    if not skip_file.exists():
+        return skip_ids
+
+    try:
+        with open(skip_file, mode="r", encoding="utf-8") as f:
+            for line in f:
+                cleaned = line.split("#")[0].strip().strip("'\"")
                 if cleaned.isdigit():
                     skip_ids.add(int(cleaned))
+    except Exception:
+        pass
 
     return skip_ids
 
 
-def append_to_skip_file(temp_data_dir: Path, mls_id: int, reason: str) -> None:
-    """Appends an invalid/inactive MLS ID to skip_mls.txt and auto-sorts the file."""
-    temp_data_dir.mkdir(parents=True, exist_ok=True)
-    skip_file = temp_data_dir / "skip_mls.txt"
-
-    existing_skips = load_skip_mls(temp_data_dir)
-
-    if mls_id not in existing_skips:
-        with open(skip_file, "a", encoding="utf-8") as f:
-            f.write(f"\n{mls_id}  # {reason}\n")
-
-        sort_and_format_skip_file(skip_file)
-
-
-def get_live_active_prod_mls(logger=None) -> set[int]:
+def load_target_mls(temp_data_dir: Path) -> set[int]:
     """
-    Queries Production DB in real time for all currently active MLS sources (mls_status_id = 2).
-    Always returns fresh state to seamlessly handle status flips across pipeline runs.
+    Loads target numeric MLS primary key IDs across api_mls.txt, rets_mls.txt, promotion_sources.txt,
+    or batch target CSV files.
     """
-    # Force reload .env to ensure fresh runtime state
-    load_dotenv(dotenv_path=current_dir / ".env")
+    target_mls = set()
 
-    # Read variables matching exact .env key signatures
-    prod_ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip().strip("'\"")
-    prod_ssh_user = os.getenv("SSH_USER", "").strip().strip("'\"")
-    prod_ssh_key = os.getenv("SSH_KEY_PATH", "").strip().strip("'\"")
-    prod_ssh_pass = os.getenv("SSH_KEY_PASSPHRASE", "").strip().strip("'\"")
+    txt_candidates = [
+        temp_data_dir / "api_mls.txt",
+        temp_data_dir / "rets_mls.txt",
+        temp_data_dir / "promotion_sources.txt",
+    ]
+    for txt_file in txt_candidates:
+        if txt_file.exists():
+            for line in txt_file.read_text(encoding="utf-8").splitlines():
+                cleaned = line.split("#")[0].strip().strip("'\"")
+                if cleaned.isdigit():
+                    target_mls.add(int(cleaned))
 
-    prod_db_host = os.getenv("PROD_DB_HOST", "").strip().strip("'\"")
-    prod_db_name = os.getenv("DB_NAME", "mls_admin").strip().strip("'\"")
-    prod_db_user = os.getenv("DB_USER", "").strip().strip("'\"")
-    prod_db_pass = os.getenv("DB_PASSWORD", "").strip().strip("'\"")
+    csv_candidates = [
+        temp_data_dir / "batch_mls_targets_api.csv",
+        temp_data_dir / "batch_mls_targets_rets.csv",
+        temp_data_dir / "batch_mls_targets.csv",
+    ]
+    for csv_file in csv_candidates:
+        if csv_file.exists():
+            try:
+                with open(csv_file, mode="r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        m_id = row.get("mls_id", "").strip()
+                        if m_id.isdigit():
+                            target_mls.add(int(m_id))
+            except Exception:
+                pass
 
-    if logger:
-        logger.info("🔍 Fetching live active MLS IDs from Production DB (mls_status_id = 2)...")
+    return target_mls
 
-    # Guardrail check to provide clear feedback instead of crashing with FileNotFoundError
-    if not prod_ssh_key or not os.path.exists(prod_ssh_key):
-        if logger:
-            logger.error(
-                f"❌ Invalid or missing SSH key path: '{prod_ssh_key}'. "
-                f"Please verify SSH_KEY_PATH in your .env file."
-            )
-        return set()
 
-    active_prod_ids = set()
+def load_target_rules(temp_data_dir: Path) -> set[str]:
+    """Loads target rule names from api_rules.txt or rets_rules.txt."""
+    target_rules = set()
 
-    try:
-        with open(prod_ssh_key, "rb") as key_file:
-            private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=prod_ssh_pass.encode() if prod_ssh_pass else None,
-            )
-        pem_data = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-        mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
+    txt_candidates = [
+        temp_data_dir / "api_rules.txt",
+        temp_data_dir / "rets_rules.txt",
+    ]
+    for txt_file in txt_candidates:
+        if txt_file.exists():
+            for line in txt_file.read_text(encoding="utf-8").splitlines():
+                cleaned = line.split("#")[0].strip().strip("'\"")
+                if cleaned:
+                    target_rules.add(cleaned)
 
-        with SSHTunnelForwarder(
-            (prod_ssh_host, 22),
-            ssh_username=prod_ssh_user,
-            ssh_pkey=mypkey,
-            remote_bind_address=(prod_db_host, 5432),
-        ) as tunnel:
-            with psycopg2.connect(
-                dbname=prod_db_name,
-                user=prod_db_user,
-                password=prod_db_pass,
-                host="127.0.0.1",
-                port=tunnel.local_bind_port,
-            ) as conn:
-                with conn.cursor() as cur:
-                    query = "SELECT id FROM public.mls WHERE mls_status_id = 2;"
-                    cur.execute(query)
-                    active_prod_ids = {int(row[0]) for row in cur.fetchall()}
-
-        if logger:
-            logger.info(f"✅ Production Check Complete: Identified {len(active_prod_ids)} active MLS ID(s) in Production.")
-
-    except Exception as err:
-        if logger:
-            logger.error(f"❌ Failed real-time Production active check: {err}", exc_info=True)
-
-    return active_prod_ids
+    return target_rules

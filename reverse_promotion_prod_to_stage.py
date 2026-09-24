@@ -14,11 +14,23 @@ import os
 import sys
 import io
 import time
+import signal
 import argparse
 import paramiko
 from pathlib import Path
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import serialization
+
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
 
 from pipeline_logger import setup_logger
 
@@ -56,10 +68,12 @@ def get_target_mls_ids(manifest_path: Path) -> list[int]:
     return unique_ids
 
 
-def main() -> None:
+def main(args_list: list[str] = None) -> None:
     parser = argparse.ArgumentParser(description="Bulk Reverse Promotion Engine (Prod -> Stage)")
     parser.add_argument("-y", "--yes", action="store_true", dest="auto_approve", help="Auto-approve execution")
-    args = parser.parse_args()
+
+    # Parse explicit args_list if provided, otherwise default to sys.argv[1:]
+    args = parser.parse_args(args_list if args_list is not None else sys.argv[1:])
 
     logger.info("============================================================")
     logger.info("🚀 REVERSE PROMOTION ENGINE INITIALIZED (PROD -> STAGE)")
@@ -71,7 +85,7 @@ def main() -> None:
 
     if not mls_ids:
         logger.info("ℹ️ No target MLS IDs found in reverse_promotion_sources.txt. Skipping Reverse Promotion.")
-        sys.exit(0)
+        return
 
     logger.info(f"🎯 [REVERSE PROMOTION GUARD] Candidate MLS IDs loaded ({len(mls_ids)}): {mls_ids}")
 

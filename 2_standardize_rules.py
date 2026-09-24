@@ -1,13 +1,8 @@
 """
 Pipeline Stage 2: High-Speed Case-Insensitive Translation Compiler.
 
-Parses extracted staging records and compiles rule identifiers into a standardized
-PascalCase naming format. Concurrently writes transformed rule files to target
-directories and outputs a workspace mapping ledger (migration_blueprint.csv).
-
-Supports target batch mode by dynamically reading 'temp-data/api_rules.txt' and/or
-'temp-data/rets_rules.txt' using rules_utils.py.
-Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
+Strictly operates in Target Batch Mode when batch targets exist in temp-data/.
+Guarantees Full Production Mode is NEVER entered during batch execution.
 """
 
 import os
@@ -17,6 +12,8 @@ import re
 import shutil
 import stat
 import time
+import sys
+import signal
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -26,6 +23,17 @@ from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
+
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
 
 from rules_utils import load_target_rules
 from pipeline_logger import setup_logger
@@ -39,7 +47,6 @@ logger = setup_logger("Stage2_StandardizeRules")
 
 
 def ensure_git_ignores_csv_artifacts(target_base_dir: Path) -> None:
-    """Ensures local .gitignore rules exist to prevent CSV artifacts from leaking into git."""
     repo_root = target_base_dir.parent
     gitignore_path = repo_root / ".gitignore"
     required_ignores = ["*.csv", "standard-rule-names/temp-data/"]
@@ -65,12 +72,10 @@ def ensure_git_ignores_csv_artifacts(target_base_dir: Path) -> None:
 
 
 def to_pascal_case(name: str) -> str:
-    """Transforms raw rule names into PascalCase filenames while preserving camelCase/PascalCase words."""
     base_name = name.removesuffix(".py")
     base_name = re.sub(r"[\(\)\[\]\{\}]", "", base_name)
     base_name = re.sub(r"[/|\\]|__", " ", base_name)
 
-    # Special Case tuple list: [(old_name, new_name)]
     special_cases = [
         ("strtonumber", "StrToNumber"),
         ("148subdivision", "148Subdivision"),
@@ -88,7 +93,6 @@ def to_pascal_case(name: str) -> str:
     for word in words:
         if not word:
             continue
-        # Preserve internal camelCase/PascalCase words (e.g., ObjectMapper, 148Subdivision)
         if re.search(r"[a-z][A-Z]", word) or re.search(r"\d+[A-Z]", word):
             pascal_words.append(word[0].upper() + word[1:])
         else:
@@ -103,7 +107,6 @@ def to_pascal_case(name: str) -> str:
 
 
 def safely_delete_dir(dir_path: Path) -> None:
-    """Removes target directory recursively, clearing read-only flags if necessary."""
     if not dir_path.exists():
         return
 
@@ -122,7 +125,6 @@ def safely_delete_dir(dir_path: Path) -> None:
 
 
 def write_standard_file(target_path: Path, content: str | None) -> None:
-    """Worker task to output individual rule file payload."""
     payload = content if content else "# No code content defined\n"
     target_path.write_text(payload, encoding="utf-8")
 
@@ -136,12 +138,28 @@ def run_standardization():
     temp_data_dir = current_dir / "temp-data"
     temp_data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Union of rules from api_rules.txt and rets_rules.txt
+    # Detect if Target Batch Mode is active
+    target_mode_active = (temp_data_dir / "batch_mls_targets.csv").exists()
+
     target_batch_rules = load_target_rules(temp_data_dir)
     env_target_rule = os.getenv("TARGET_RULE_NAME", "").strip().strip("'\"") or None
 
     if env_target_rule:
         target_batch_rules.add(env_target_rule)
+
+    # STRICT GUARD: If Target Mode is active, NEVER run Full Production
+    if target_mode_active:
+        if not target_batch_rules:
+            logger.info("🎯 [TARGET BATCH MODE] Target batch active, but 0 rule mutations are pending.")
+            logger.info("ℹ️ Skipping Stage 2 standardized compilation.")
+
+            csv_output_path = temp_data_dir / "migration_blueprint.csv"
+            with open(csv_output_path, mode="w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(["old_name", "target_new_name"])
+            sys.exit(0)
+    else:
+        logger.info("🚀 [FULL PRODUCTION MODE] Executing manual full database scan...")
 
     target_base_dir = Path(repo_path) / "standard-rule-names"
     target_active_dir = target_base_dir / "active"
@@ -167,7 +185,6 @@ def run_standardization():
     csv_output_path = temp_data_dir / "migration_blueprint.csv"
     ensure_git_ignores_csv_artifacts(target_base_dir)
 
-    # Staging SSH & DB Configuration with Fallbacks
     ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
     ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
     ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
@@ -211,23 +228,33 @@ def run_standardization():
                     if target_batch_rules:
                         logger.info(f"🎯 [TARGET BATCH MODE] Targeting {len(target_batch_rules)} rule(s)...")
                         select_query = """
-                            SELECT id, name, content, description, params, "order", created_at, deleted_at 
+                            SELECT id, 
+                                   name, 
+                                   content, 
+                                   description, 
+                                   params, 
+                                   "order", 
+                                   created_at, 
+                                   deleted_at
                             FROM public.process_rule
-                            WHERE name = ANY(%s);
+                            WHERE name = ANY (%s);
                         """
                         cur.execute(select_query, (list(target_batch_rules),))
                     else:
-                        logger.info("🚀 [FULL PRODUCTION MODE] Pulling all process_rule records...")
                         select_query = """
-                            SELECT id, name, content, description, params, "order", created_at, deleted_at 
+                            SELECT id, 
+                                   name, 
+                                   content, 
+                                   description, 
+                                   params, 
+                                   "order", 
+                                   created_at, 
+                                   deleted_at
                             FROM public.process_rule;
                         """
                         cur.execute(select_query)
 
                     rows = cur.fetchall()
-                    if not rows and target_batch_rules:
-                        logger.warning("No records found matching target rule names.")
-
                     for row in rows:
                         _, old_name, content, _, _, _, created_at, deleted_at = row[:8]
                         if not old_name:
@@ -323,13 +350,12 @@ def run_standardization():
     logger.info("============================================================")
     logger.info("🚀 PHASE 2 COMPLETE: HIGH-SPEED CASE-INSENSITIVE COMPILER")
     logger.info("============================================================")
-    logger.info(f"Mode                                     : {'TARGET BATCH (' + str(len(target_batch_rules)) + ' rules)' if target_batch_rules else 'FULL PRODUCTION'}")
+    logger.info(
+        f"Mode                                     : {'TARGET BATCH (' + str(len(target_batch_rules)) + ' rules)' if target_batch_rules else 'FULL PRODUCTION'}")
     logger.info(f"Standardized Active Rules Written        : {active_copied_count}")
     logger.info(f"Standardized Archived Rules Written      : {archived_copied_count}")
     logger.info(f"Unified (Active + Deleted) Rows in CSV   : {len(csv_rows)}")
     logger.info(f"Isolated Blueprint CSV Path              : {csv_output_path}")
-    if failed_writes > 0:
-        logger.warning(f"⚠️ Encountered {failed_writes} failed file write tasks.")
     logger.info("============================================================")
 
 

@@ -13,9 +13,20 @@ Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 
 import sys
 import os
+import signal
+import logging
 import importlib.util
 from pathlib import Path
 from dotenv import load_dotenv
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
 
 from rules_utils import load_target_mls
 from pipeline_logger import setup_logger
@@ -94,6 +105,19 @@ try:
 except Exception as e:
     logger.warning(f"Snowflake namespace intercept skipped: {e}")
 
+
+def attach_pipeline_handlers_to_bulk_tool():
+    """Attaches Stage 5 logger handlers to bulk_map_tool and root logger."""
+    for handler in logger.handlers:
+        logging.getLogger().addHandler(handler)
+        logging.getLogger("bulk_update_maps").addHandler(handler)
+        logging.getLogger("bulk_map_tool").addHandler(handler)
+
+    # Propagate bulk map tool loggers to root
+    logging.getLogger("bulk_update_maps").setLevel(logging.INFO)
+    logging.getLogger("bulk_map_tool").setLevel(logging.INFO)
+
+
 if __name__ == "__main__":
     try:
         temp_data_dir = current_dir / "temp-data"
@@ -104,7 +128,8 @@ if __name__ == "__main__":
         # Check raw_targeted_rules.csv existence and line count
         raw_targeted_csv = temp_data_dir / "raw_targeted_rules.csv"
         if not raw_targeted_csv.exists() or raw_targeted_csv.stat().st_size == 0:
-            logger.info("ℹ️ No pending targeted rule mutations found in raw_targeted_rules.csv. Skipping Stage 5 DB mutation.")
+            logger.info(
+                "ℹ️ No pending targeted rule mutations found in raw_targeted_rules.csv. Skipping Stage 5 DB mutation.")
             sys.exit(0)
 
         # Inspect if CSV contains actual data rows beyond header
@@ -115,6 +140,9 @@ if __name__ == "__main__":
                 sys.exit(0)
 
         import bulk_map_tool
+
+        # Intercept and attach logging handlers to capture bulk_map_tool output centrally
+        attach_pipeline_handlers_to_bulk_tool()
 
         passthrough_args = sys.argv[1:]
 

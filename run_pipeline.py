@@ -2,28 +2,28 @@
 Master Migration Pipeline Orchestrator.
 
 Sequentially executes Stages 0 through 11 with built-in error handling,
-dry-run verification gates, timing pause prompts, and user confirmation steps.
-
-Pipeline Flow:
-    Stage 0   : Target Selection & Reverse Promotion (API & RETS -> Prod to Stage Sync)
-    Stage 1   : Core Database Ingress Backup
-    Stage 2   : Rule Standardization & Blueprint Compilation
-    Stage 3   : Microservice Rule Registration
-    Stage 4   : Targeted Mutation CSV & Manifest Generation
-    Stage 5   : Staging Bulk Update
-    Stage 6   : Disable Ingestion Jobs
-    Stage 7   : Draft Slack Notification & Production Promotion
-    Stage 8   : Re-enable Jobs & Trigger Manual Downloads
-    Stage 9   : Verify Ingestion & Re-enable API Jobs
-    Stage 10  : Safe Soft Delete Legacy Rules
-    Stage 11  : Repository Archival & Ledger Update
+jira ticket assignment targeting, dry-run verification gates, timing pause prompts, and user confirmation steps.
 """
 
+import os
 import sys
 import time
+import signal
 import argparse
 import subprocess
 from pathlib import Path
+
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
 from pipeline_logger import setup_logger
 
 logger = setup_logger("MasterPipeline")
@@ -48,8 +48,12 @@ def run_stage(script_name: str, args: list[str] = None) -> bool:
 
 def prompt_user_confirmation(prompt_text: str) -> bool:
     """Prompts the operator for explicit Y/N confirmation."""
-    answer = input(f"\n⚠️  {prompt_text} (y/N): ").strip().lower()
-    return answer == "y"
+    try:
+        answer = input(f"\n⚠️  {prompt_text} (y/N): ").strip().lower()
+        return answer == "y"
+    except (KeyboardInterrupt, EOFError):
+        logger.warning("\n⛔ Execution aborted by operator input.")
+        os._exit(1)
 
 
 def main() -> None:
@@ -67,6 +71,13 @@ def main() -> None:
         default=4,
         dest="limit",
         help="Batch limit for Stage 0 (default: 4)"
+    )
+    parser.add_argument(
+        "-a", "--assigned-mls",
+        type=str,
+        default=None,
+        dest="assigned_mls",
+        help="Comma-separated MLS IDs for Jira ticket targeting (e.g. --assigned-mls 502,162,483)"
     )
     parser.add_argument(
         "-s", "--start-at",
@@ -93,7 +104,9 @@ def main() -> None:
     logger.info("============================================================")
     logger.info("🏁 STARTING AUTOMATED MLS MIGRATION PIPELINE")
     if start_at > 0:
-        logger.info(f"   ⏩ Resuming execution from Stage {start_at}")
+        logger.info(f"    ⏩ Resuming execution from Stage {start_at}")
+    if args.assigned_mls:
+        logger.info(f"    🎯 Jira Ticket Target Filter Active: [{args.assigned_mls}]")
     logger.info("============================================================")
 
     # ------------------------------------------------------------
@@ -101,6 +114,8 @@ def main() -> None:
     # ------------------------------------------------------------
     if start_at <= 0:
         stage0_args = ["--limit", str(args.limit)]
+        if args.assigned_mls:
+            stage0_args.extend(["--assigned-mls", args.assigned_mls])
         if args.auto_approve:
             stage0_args.append("-y")
 
@@ -208,7 +223,7 @@ def main() -> None:
         # Interactive Wait Gate
         logger.info("============================================================")
         logger.info("⏳ PRODUCTION DOWNLOADS TRIGGERED IN STAGE 8")
-        logger.info(f"   Downloads typically take up to {args.wait_mins} minutes to process in BigQuery.")
+        logger.info(f"    Downloads typically take up to {args.wait_mins} minutes to process in BigQuery.")
         logger.info("============================================================")
 
         if args.auto_approve:
@@ -244,11 +259,10 @@ def main() -> None:
             sys.exit(1)
 
     # ------------------------------------------------------------
-    # STAGE 11: Consolidated Repo Sync, Archival & Ledger Update
+    # STAGE 11: Consolidated Repo Sync, Archival & Ledger Update (Auto-Clean Active)
     # ------------------------------------------------------------
     if start_at <= 11:
-        stage11_args = ["-y"] if args.auto_approve else []
-        if not run_stage("11_update_consolidated_repo.py", stage11_args):
+        if not run_stage("11_update_consolidated_repo.py", ["-y"]):
             sys.exit(1)
 
     logger.info("============================================================")

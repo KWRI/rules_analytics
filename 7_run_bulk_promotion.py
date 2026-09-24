@@ -18,11 +18,21 @@ import os
 import sys
 import io
 import time
+import signal
 import argparse
 import paramiko
 from pathlib import Path
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import serialization
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
 
 from draft_slack_message import draft_slack_message
 from pipeline_logger import setup_logger
@@ -63,8 +73,12 @@ def get_target_mls_ids(manifest_path: Path) -> list[int]:
 
 def prompt_user_confirmation(prompt_text: str) -> bool:
     """Prompts the operator for explicit Y/N confirmation."""
-    answer = input(f"\n⚠️  {prompt_text} (y/N): ").strip().lower()
-    return answer == "y"
+    try:
+        answer = input(f"\n⚠️  {prompt_text} (y/N): ").strip().lower()
+        return answer == "y"
+    except (EOFError, KeyboardInterrupt):
+        logger.warning("\n⛔ Operator cancelled input prompt. Exiting Stage 7 immediately.")
+        os._exit(1)
 
 
 def main() -> None:

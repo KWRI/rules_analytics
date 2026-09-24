@@ -16,7 +16,7 @@ def setup_logger(script_name: str) -> logging.Logger:
     LOGS_DIR = Path("logs")
     LOGS_DIR.mkdir(exist_ok=True)
 
-    # Log file named by date (e.g., logs/pipeline_2026-07-30.log)
+    # Log file named by date (e.g., logs/pipeline_2026-09-23.log)
     today_str = datetime.now().strftime("%Y-%m-%d")
     log_file_path = LOGS_DIR / f"pipeline_{today_str}.log"
 
@@ -27,7 +27,7 @@ def setup_logger(script_name: str) -> logging.Logger:
     if logger.hasHandlers():
         return logger
 
-    # Formatting: [2026-07-30 14:22:01] [INFO] [script_name] Message
+    # Formatting: [2026-09-23 14:22:01] [INFO] [script_name] Message
     formatter = logging.Formatter(
         fmt="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"

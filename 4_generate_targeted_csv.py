@@ -17,6 +17,8 @@ import io
 import json
 import csv
 import time
+import sys
+import signal
 import warnings
 from pathlib import Path
 import psycopg2
@@ -25,6 +27,17 @@ from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
+
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
 
 from rules_utils import load_target_mls, load_processed_ledger
 from pipeline_logger import setup_logger
@@ -128,7 +141,8 @@ def run_production_extractor():
 
     target_batch_mls = load_target_mls(temp_data_dir)
     if target_batch_mls:
-        logger.info(f"🎯 [MLS BATCH TARGET] Targeting {len(target_batch_mls)} specified MLS ID(s): {sorted(list(target_batch_mls))}")
+        logger.info(
+            f"🎯 [MLS BATCH TARGET] Targeting {len(target_batch_mls)} specified MLS ID(s): {sorted(list(target_batch_mls))}")
     else:
         logger.info("🚀 [FULL MODE] Executing extraction across ALL active MLS configurations...")
 
@@ -144,25 +158,12 @@ def run_production_extractor():
                 clean_new_name = proposed_new_name[:-3] if proposed_new_name.endswith(".py") else proposed_new_name
 
                 if old_name == clean_new_name:
-                    logger.info(f"ℹ️ Skipping rule '{old_name}' from CSV extraction because old name matches proposed new name.")
+                    logger.info(
+                        f"ℹ️ Skipping rule '{old_name}' from CSV extraction because old name matches proposed new name.")
                     skipped_identical_count += 1
                     continue
 
                 blueprint_mapping[old_name] = clean_new_name
-
-    if not blueprint_mapping:
-        if skipped_identical_count > 0:
-            logger.info(f"Skipped all {skipped_identical_count} candidate rule(s) because old and proposed new names are identical. No CSV generated.")
-            if target_batch_mls:
-                update_ledger_directly(temp_data_dir, target_batch_mls)
-        else:
-            logger.info("No active rule mutations mapped in the blueprint to extract.")
-        # Ensure promotion_sources.txt is empty if no mutations exist
-        txt_output_path.write_text("", encoding="utf-8")
-        return
-
-    target_rules_set = set(blueprint_mapping.keys())
-    logger.info(f"🎯 Target Rules Loaded from Blueprint: Processing {len(target_rules_set)} active rule mutation(s).")
 
     headers = [
         "vendor_name", "mls_id_str", "mls_id", "mls_name", "download_protocol",
@@ -170,6 +171,26 @@ def run_production_extractor():
         "mapper_func", "mapper_params", "transform_func", "transform_params",
         "rule_func", "rule_params", "enhance_func", "enhance_params"
     ]
+
+    if not blueprint_mapping:
+        if skipped_identical_count > 0:
+            logger.info(
+                f"Skipped all {skipped_identical_count} candidate rule(s) because old and proposed new names are identical. No CSV generated.")
+            if target_batch_mls:
+                update_ledger_directly(temp_data_dir, target_batch_mls)
+        else:
+            logger.info("No active rule mutations mapped in the blueprint to extract.")
+
+        # Write empty header row so bulk_map_tool can safely load CSV headers
+        with open(output_csv_path, mode="w", newline="", encoding="utf-8") as f:
+            csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow(headers)
+
+        # Ensure promotion_sources.txt is empty if no mutations exist
+        txt_output_path.write_text("", encoding="utf-8")
+        return
+
+    target_rules_set = set(blueprint_mapping.keys())
+    logger.info(f"🎯 Target Rules Loaded from Blueprint: Processing {len(target_rules_set)} active rule mutation(s).")
 
     with open(output_csv_path, mode="w", newline="", encoding="utf-8") as f:
         csv.writer(f, quoting=csv.QUOTE_MINIMAL).writerow(headers)
@@ -202,48 +223,47 @@ def run_production_extractor():
 
         logger.info(f"Establishing SSH tunnel to connect to database '{db_name}'...")
         with SSHTunnelForwarder(
-            (ssh_host, 22),
-            ssh_username=ssh_user,
-            ssh_pkey=mypkey,
-            remote_bind_address=(db_host, 5432),
+                (ssh_host, 22),
+                ssh_username=ssh_user,
+                ssh_pkey=mypkey,
+                remote_bind_address=(db_host, 5432),
         ) as tunnel:
             with psycopg2.connect(
-                dbname=db_name,
-                user=db_user,
-                password=db_pass,
-                host="127.0.0.1",
-                port=tunnel.local_bind_port,
+                    dbname=db_name,
+                    user=db_user,
+                    password=db_pass,
+                    host="127.0.0.1",
+                    port=tunnel.local_bind_port,
             ) as conn:
                 cursor_name = f"master_bulk_sweep_stream_cursor_{int(time.time())}"
                 with conn.cursor(name=cursor_name) as streaming_cur:
                     streaming_cur.itersize = 200
 
                     query = """
-                        SELECT DISTINCT 
-                            v.name            AS vendor_name,
-                            m.id_str          AS mls_id_str,
-                            m.id              AS mls_id,
-                            m.name            AS mls_name,
-                            dp.name           AS download_protocol,
-                            ctm.content_type  AS content_type,
-                            ctm.content_sub_type AS content_sub_type,
-                            'true'            AS is_enabled,
-                            pm.properties     AS raw_properties,
-                            pm.mapping_fields AS raw_mapping_fields
-                        FROM mls m
-                        JOIN mls_resource mr    ON m.id = mr.mls_id
-                        JOIN map_rule_association mra ON mr.process_map_id = mra.process_map_id
-                        JOIN process_rule pr    ON mra.process_rule_id = pr.id
-                        LEFT JOIN process_map pm ON pm.id = mra.process_map_id
-                        JOIN vendor v            ON v.id = m.vendor_id
-                        JOIN content_type_map ctm ON ctm.id = mr.content_type_map_id
-                        JOIN download_mls dm    ON dm.mls_id = m.id
-                        JOIN download_config dc  ON dc.id = dm.download_config_id
-                        JOIN download_protocol dp ON dp.id = dc.download_protocol_id
-                        WHERE m.mls_status_id = 2
-                          AND pr.deleted_at IS NULL
-                          AND pr.name = ANY(%s);
-                    """
+                            SELECT DISTINCT v.name               AS vendor_name, \
+                                            m.id_str             AS mls_id_str, \
+                                            m.id                 AS mls_id, \
+                                            m.name               AS mls_name, \
+                                            dp.name              AS download_protocol, \
+                                            ctm.content_type     AS content_type, \
+                                            ctm.content_sub_type AS content_sub_type, \
+                                            'true'               AS is_enabled, \
+                                            pm.properties        AS raw_properties, \
+                                            pm.mapping_fields    AS raw_mapping_fields
+                            FROM mls m
+                                     JOIN mls_resource mr ON m.id = mr.mls_id
+                                     JOIN map_rule_association mra ON mr.process_map_id = mra.process_map_id
+                                     JOIN process_rule pr ON mra.process_rule_id = pr.id
+                                     LEFT JOIN process_map pm ON pm.id = mra.process_map_id
+                                     JOIN vendor v ON v.id = m.vendor_id
+                                     JOIN content_type_map ctm ON ctm.id = mr.content_type_map_id
+                                     JOIN download_mls dm ON dm.mls_id = m.id
+                                     JOIN download_config dc ON dc.id = dm.download_config_id
+                                     JOIN download_protocol dp ON dp.id = dc.download_protocol_id
+                            WHERE m.mls_status_id = 2
+                              AND pr.deleted_at IS NULL
+                              AND pr.name = ANY (%s); \
+                            """
                     streaming_cur.execute(query, (list(target_rules_set),))
 
                     with open(output_csv_path, mode="a", newline="", encoding="utf-8") as csv_file:
@@ -355,7 +375,8 @@ def run_production_extractor():
                 if target_batch_mls:
                     no_op_mls_ids = target_batch_mls.difference(captured_mls_ids)
                     if no_op_mls_ids:
-                        logger.info(f"ℹ️ Found {len(no_op_mls_ids)} MLS source(s) requiring 0 rule mutations: {sorted(list(no_op_mls_ids))}")
+                        logger.info(
+                            f"ℹ️ Found {len(no_op_mls_ids)} MLS source(s) requiring 0 rule mutations: {sorted(list(no_op_mls_ids))}")
                         update_ledger_directly(temp_data_dir, no_op_mls_ids)
 
                 logger.info("============================================================")

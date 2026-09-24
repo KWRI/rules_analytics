@@ -9,7 +9,9 @@ under 'ui-rules/active/' and 'ui-rules/archived/'.
 import os
 import io
 import re
+import sys
 import time
+import signal
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -20,6 +22,15 @@ from sshtunnel import SSHTunnelForwarder
 from cryptography.utils import CryptographyDeprecationWarning
 from cryptography.hazmat.primitives import serialization
 from pipeline_logger import setup_logger
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
 
 warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*TripleDES.*")

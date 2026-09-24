@@ -12,7 +12,9 @@ Logs execution events to 'logs/pipeline_YYYY-MM-DD.log'.
 
 import os
 import csv
+import sys
 import time
+import signal
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
@@ -20,6 +22,15 @@ from dotenv import load_dotenv
 from google.cloud import bigquery
 import google.auth
 from google_auth_oauthlib.flow import InstalledAppFlow
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
 
 from pipeline_logger import setup_logger
 

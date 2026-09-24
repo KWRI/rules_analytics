@@ -12,7 +12,18 @@ Logs execution details to 'logs/pipeline_YYYY-MM-DD.log'.
 import csv
 import json
 import sys
+import os
+import signal
 from pathlib import Path
+
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
 
 from pipeline_logger import setup_logger
 

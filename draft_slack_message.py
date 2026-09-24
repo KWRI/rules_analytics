@@ -1,3 +1,11 @@
+"""
+Draft Slack Notification Engine.
+
+Reads target numeric MLS IDs from 'temp-data/promotion_sources.txt', fetches metadata
+from the Staging database via SSH tunnel, maps protocol names, formats a GitHub-flavored
+Markdown table for Slack, and automatically copies the payload to the Windows clipboard.
+"""
+
 import os
 import io
 import sys

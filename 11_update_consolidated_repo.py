@@ -2,8 +2,9 @@
 Pipeline Stage 11: Update Consolidated Repo Script (With Safe Archival Check)
 
 Moves soft-deleted legacy rule files from active/ to archived/ in the git repository ONLY
-if they have been soft-deleted in the database. Updates processed_mls_ledger.json,
-purges log files older than 3 days, and cleans up local workspace artifacts (preserving ledger and skip list).
+if they have been soft-deleted in the database. Finalizes target batch status to 'COMPLETED'
+in the central DB ledger, updates local processed_mls_ledger.json, purges log files older
+than 3 days, and cleans up local workspace artifacts (preserving ledger, skip, and discrepant lists).
 """
 
 import os
@@ -11,6 +12,7 @@ import sys
 import json
 import io
 import shutil
+import signal
 import argparse
 import csv
 from datetime import datetime, timedelta
@@ -22,6 +24,16 @@ from dotenv import load_dotenv
 from sshtunnel import SSHTunnelForwarder
 from cryptography.hazmat.primitives import serialization
 
+# --- OS-LEVEL INSTANT TERMINAL EXIT ---
+def force_terminal_exit(sig, frame):
+    print("\n⛔ [TERMINAL ABORT] Killing process tree immediately...")
+    os._exit(1)
+
+signal.signal(signal.SIGINT, force_terminal_exit)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, force_terminal_exit)
+
+from rules_utils import finalize_mls_batch_in_db
 from pipeline_logger import setup_logger
 
 current_dir = Path(__file__).resolve().parent
@@ -122,7 +134,6 @@ def archive_legacy_rules(blueprint_path: Path, repo_base_path: Path) -> bool:
 
     logger.info(f"📄 Loaded {len(old_rule_names)} legacy rule name candidate(s) from blueprint.")
 
-    # Check which rules are soft-deleted in DB
     logger.info("🔍 Checking DB to identify soft-deleted legacy rules...")
     deleted_rules = get_deleted_rules_set(old_rule_names)
     logger.info(f"Verified {len(deleted_rules)}/{len(old_rule_names)} rule(s) are soft-deleted in DB.")
@@ -157,29 +168,14 @@ def archive_legacy_rules(blueprint_path: Path, repo_base_path: Path) -> bool:
     return True
 
 
-def update_processed_ledger(temp_dir: Path) -> None:
+def update_processed_ledger(temp_dir: Path) -> list[tuple[int, str]]:
     """
-    Appends ALL MLS IDs selected across batch text manifests, CSVs, and promotion records
-    directly to processed_mls_ledger.json.
-    Guarantees no-op/already-standardized MLS sources are logged permanently.
+    Appends ALL MLS primary key integer IDs and mls_id_str values selected across batch text manifests, CSVs,
+    and promotion records directly to processed_mls_ledger.json and returns the target tuples.
     """
     ledger_file = temp_dir / "processed_mls_ledger.json"
-    current_mls = set()
+    current_targets = {}
 
-    # 1. Parse text manifests (api_mls.txt, rets_mls.txt, promotion_sources.txt)
-    txt_candidates = [
-        temp_dir / "api_mls.txt",
-        temp_dir / "rets_mls.txt",
-        temp_dir / "promotion_sources.txt",
-    ]
-    for txt_file in txt_candidates:
-        if txt_file.exists():
-            for line in txt_file.read_text(encoding="utf-8").splitlines():
-                cleaned = line.split("#")[0].strip().strip("'\"")
-                if cleaned.isdigit():
-                    current_mls.add(int(cleaned))
-
-    # 2. Parse CSV batch target files
     csv_candidates = [
         temp_dir / "batch_mls_targets_rets.csv",
         temp_dir / "batch_mls_targets_api.csv",
@@ -190,13 +186,31 @@ def update_processed_ledger(temp_dir: Path) -> None:
             with open(csv_file, mode="r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    mls_id = row.get("mls_id", "").strip()
-                    if mls_id.isdigit():
-                        current_mls.add(int(mls_id))
+                    m_id = row.get("mls_id", "").strip()
+                    m_id_str = row.get("mls_id_str", "").strip()
+                    if m_id.isdigit():
+                        current_targets[int(m_id)] = m_id_str if m_id_str else m_id
 
-    if not current_mls:
+    txt_candidates = [
+        temp_dir / "api_mls.txt",
+        temp_dir / "rets_mls.txt",
+        temp_dir / "promotion_sources.txt",
+    ]
+    for txt_file in txt_candidates:
+        if txt_file.exists():
+            for line in txt_file.read_text(encoding="utf-8").splitlines():
+                cleaned = line.split("#")[0].strip().strip("'\"")
+                if cleaned.isdigit():
+                    m_id_int = int(cleaned)
+                    if m_id_int not in current_targets:
+                        current_targets[m_id_int] = str(m_id_int)
+
+    batch_targets = sorted([(k, v) for k, v in current_targets.items()], key=lambda x: x[0])
+    batch_ids = [k for k, _ in batch_targets]
+
+    if not batch_ids:
         logger.info("ℹ️ No active MLS IDs detected in batch files to record in ledger.")
-        return
+        return []
 
     completed_mls = set()
     if ledger_file.exists():
@@ -206,14 +220,69 @@ def update_processed_ledger(temp_dir: Path) -> None:
         except Exception:
             pass
 
-    completed_mls.update(current_mls)
+    completed_mls.update(batch_ids)
     ledger_file.parent.mkdir(parents=True, exist_ok=True)
     ledger_file.write_text(
         json.dumps({"completed_mls_ids": sorted(list(completed_mls))}, indent=2),
         encoding="utf-8"
     )
 
-    logger.info(f"✅ Ledger Updated: Recorded {len(current_mls)} MLS ID(s) ({', '.join(str(x) for x in sorted(list(current_mls)))}) in '{ledger_file.name}'.")
+    logger.info(f"✅ Local Ledger Updated: Recorded {len(batch_ids)} MLS ID(s) ({', '.join(str(x) for x in batch_ids)}) in '{ledger_file.name}'.")
+    return batch_targets
+
+
+def mark_batch_completed_in_db(batch_targets: list[tuple[int, str]]) -> None:
+    """Updates target MLS primary key integer IDs and mls_id_str to 'COMPLETED' in central public.processed_mls_ledger."""
+    if not batch_targets:
+        return
+
+    ssh_host = (os.getenv("STAGE_SSH_HOST") or os.getenv("REMOTE_SSH_HOST") or os.getenv("SSH_HOST", "")).strip("'\"")
+    ssh_user = (os.getenv("SSH_USER") or os.getenv("REMOTE_SSH_USER", "")).strip("'\"")
+    ssh_key_path = (os.getenv("SSH_KEY_PATH") or os.getenv("REMOTE_SSH_KEY_PATH", "")).strip("'\"")
+    ssh_passphrase = (os.getenv("SSH_KEY_PASSPHRASE") or os.getenv("REMOTE_SSH_KEY_PASSPHRASE", "")).strip("'\"")
+
+    db_host = (os.getenv("STAGE_DB_HOST") or os.getenv("DB_HOST", "")).strip("'\"")
+    db_name = (os.getenv("DB_NAME", "mls_admin")).strip("'\"")
+    db_user = (os.getenv("DB_USER", "")).strip("'\"")
+    db_pass = (os.getenv("DB_PASSWORD", "")).strip("'\"")
+
+    if not ssh_host or not ssh_key_path:
+        logger.warning("⚠️ SSH parameters missing. Skipping central DB ledger finalization.")
+        return
+
+    try:
+        with open(ssh_key_path, "rb") as key_file:
+            private_key = serialization.load_pem_private_key(
+                key_file.read(),
+                password=ssh_passphrase.encode() if ssh_passphrase else None,
+            )
+        pem_data = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        mypkey = paramiko.RSAKey.from_private_key(io.StringIO(pem_data.decode()))
+
+        with SSHTunnelForwarder(
+            (ssh_host, 22),
+            ssh_username=ssh_user,
+            ssh_pkey=mypkey,
+            remote_bind_address=(db_host, 5432),
+        ) as tunnel:
+            with psycopg2.connect(
+                dbname=db_name,
+                user=db_user,
+                password=db_pass,
+                host="127.0.0.1",
+                port=tunnel.local_bind_port,
+            ) as conn:
+                current_user = os.getenv("DB_USER") or os.getenv("USERNAME") or "migration_pipeline_bot"
+                finalize_mls_batch_in_db(conn, batch_targets, current_user)
+                batch_ids = [m_id for m_id, _ in batch_targets]
+                logger.info(f"✅ DB Ledger Finalized: Marked MLS ID(s) {batch_ids} as 'COMPLETED' in DB table.")
+
+    except Exception as e:
+        logger.error(f"❌ Failed to finalize DB ledger status: {e}", exc_info=True)
 
 
 def cleanup_old_logs(logs_dir: Path, keep_days: int = 3) -> None:
@@ -268,8 +337,9 @@ def main() -> None:
         logger.error("❌ Sync halted due to error.")
         return
 
-    # Update ledger prior to optional temp folder cleanup
-    update_processed_ledger(temp_dir)
+    # Update local ledger and finalize status in central PostgreSQL ledger
+    batch_targets = update_processed_ledger(temp_dir)
+    mark_batch_completed_in_db(batch_targets)
 
     # Clean logs older than 3 days
     logs_dir = current_dir / "logs"
@@ -282,14 +352,14 @@ def main() -> None:
             do_clean = True
 
     if do_clean:
-        preserved_files = {"processed_mls_ledger.json", "skip_mls.txt"}
+        preserved_files = {"processed_mls_ledger.json", "skip_mls.txt", "discrepant_mls.txt"}
         for item in temp_dir.glob("*"):
             if item.name not in preserved_files:
                 if item.is_file():
                     item.unlink()
                 elif item.is_dir():
                     shutil.rmtree(item)
-        logger.info("🧹 Clean complete! Temporary working files removed (ledger and skip_mls preserved).")
+        logger.info("🧹 Clean complete! Temporary working files removed (ledger and skip lists preserved).")
     else:
         logger.info("ℹ️ Cleanup skipped. Working files retained in 'temp-data/'.")
 
